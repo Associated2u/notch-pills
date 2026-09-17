@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# ask-now — capture and send to whichever agent the ASK pill is showing. Bind this to a key.
+#
+# WHY THIS IS A SEPARATE PROCESS FROM THE PILL
+#   02-pills.md: "tick() runs at 1 Hz on the GTK main loop. No subprocess, no network."
+#   The pill only writes ~/.askbar/selected on click and reads ~/.askbar/last on tick. Every
+#   slow thing -- the region grab, OCR, the secret scan, the scp -- happens HERE, out of the
+#   panel's process, so a 3-minute capture cannot freeze the system/LAYOUTS/NOTE/FLEET pills.
+#
+#   It also replaces the standalone bar's drag-onto-a-window gesture, which cannot survive on
+#   an ANCHORED pill. A keybind is a better fit anyway: fewer movements, no aiming.
+#
+# usage: ask-now [region|window|screen|none] [-- text...]
+set -uo pipefail
+SEL="$HOME/.askbar/selected"
+ASK="${MROG_ROOT:-$HOME/mrog}/askbar/ask"
+agent="$(cat "$SEL" 2>/dev/null)"; agent="${agent:-claude}"
+mode="${1:-region}"; [ $# -gt 0 ] && shift
+open_flag=""
+[ "${1:-}" = "--open" ] && { open_flag="--open"; shift; }
+[ "${1:-}" = "--" ] && shift
+text="$*"
+
+args=("$ASK" --to "$agent" "--$mode")
+[ -n "$open_flag" ] && args+=("$open_flag")
+[ -n "$text" ] && args+=(--text "$text")
+
+out="$("${args[@]}" 2>&1)"
+verdict="$(printf '%s' "$out" | head -1)"
+
+# Tell Chris what happened without making him look at a terminal. notify-send if present;
+# the pill also turns REFUSED red on its next tick from ~/.askbar/last either way.
+if command -v notify-send >/dev/null 2>&1; then
+  case "$verdict" in
+    OK*)      notify-send -u low  "ask → $agent" "$(printf '%s' "$out" | sed -n 2p)" ;;
+    REFUSED*) notify-send -u critical "ask REFUSED" "capture looked like it contained a credential; nothing was sent" ;;
+    *)        notify-send -u normal "ask failed" "$verdict" ;;
+  esac
+fi
+printf '%s\n' "$out"

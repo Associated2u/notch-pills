@@ -1,0 +1,161 @@
+# askbar/agents.example.yml — THE AGENT REGISTRY, as a template.
+#
+# Copy to agents.yml and fill in your own rows. Both layers read this file: `ask` (capture →
+# OCR → secret scan → drop → open a session) and the ASK pill (draws buttons from it). Adding
+# an agent is a row here, never a code change. Validate with:  python3 _regcheck.py agents.yml
+#
+# EVERY FIELD, WHAT IT DECIDES
+#   id / label / color   the selector. Click the dot to cycle agents; you learn the colour.
+#   model                tiny text that flashes on landing.
+#   vision               MEASURE IT. true only if the backend the route actually reaches accepts
+#                        an image. A text-only agent gets the OCR sidecar as its whole payload.
+#                        Anything but a real YAML `true` is treated as NO VISION (fail-closed).
+#   drop                 HOST:/ABSOLUTE/PATH where the capture lands, AS THE AGENT SEES IT.
+#                        A host equal to this machine is a local copy; anything else is scp.
+#   drop_via             auto | spine_md (name the file ask_<stamp>.md instead of .txt)
+#   launch               how to open a fresh interactive session (used by --new-session)
+#   ask_host             where ask_cmd RUNS: "local" or an ssh target
+#   agent_ssh            where the process that OPENS the file runs, and as whom. Usually the
+#                        same as ask_host; differs when ask_cmd is a bridge to a third machine.
+#   ask_cmd              what delivers the question. {q} becomes a one-line prompt naming the
+#                        dropped file — the question itself is IN the file, never in argv.
+#                        First token must be an ABSOLUTE path: a non-interactive ssh shell has
+#                        almost nothing on PATH.
+#   followup             native  — ask_cmd holds the terminal itself (a REPL, or a CLI that
+#                                  stays open after answering). The window shows "enter to close"
+#                                  when it exits.
+#                        resume  — ask_cmd is a one-shot that persists a session. Needs:
+#     sid_cmd            prints the id of the session the one-shot just created (last line wins)
+#     followup_cmd       next turn; reads the follow-up text from STDIN; {sid} is substituted
+#     session_cmd        opens the agent's full REPL on {sid} (the window's /session)
+#   health               free probes for ask-selftest: cmd + a regex `ok` matched POSITIVELY
+#                        against healthy output. Never `--version` — it proves the name
+#                        resolves, not that the program starts with its credential.
+#   test_cmd             the NON-interactive one-shot form, for the canary round trip
+#   paid                 true = metered backend; the canary skips it unless --paid
+#   agent_timeout        seconds for the canary on a slow backend (default is global)
+#   constraints          free text shown in the drop-down; rules you want in front of you
+
+# The rows this registry must contain: _regcheck.py fails if one vanishes or an unlisted one
+# appears. Edit it when you add or retire an agent. Omit it and the check is skipped with a note.
+expected_ids: [local, remote, bridged]
+
+agents:
+  # 1. A LOCAL CLI agent whose one-shot IS a REPL primed with the question (e.g. Claude Code).
+  - id: local
+    label: Local CLI
+    color: "#d97757"
+    model: "your-model"
+    vision: true
+    drop: "localhost:/home/YOU/asks"
+    drop_via: auto
+    launch: "/home/YOU/.local/bin/agent-cli"
+    ask_host: local
+    agent_ssh: "YOU@localhost"
+    ask_cmd: "/usr/bin/env -C /home/YOU/work /home/YOU/.local/bin/agent-cli {q}"
+    followup: native
+    health:
+      - what: "the model actually answers (the sum must be computed, not echoed)"
+        cmd: "/home/YOU/.local/bin/agent-cli -p 'Reply with only the number that is 317 plus 486.'"
+        ok: "\\b803\\b"
+    test_cmd: "/home/YOU/.local/bin/agent-cli -p {q}"
+    constraints: []
+
+  # 2. A REMOTE agent reached over ssh whose one-shot persists a resumable session
+  #    (e.g. Hermes: `-z` answers, `sessions list` names the session, `--resume` continues it).
+  - id: remote
+    label: Remote
+    color: "#c678dd"
+    model: "remote-model"
+    vision: false
+    drop: "agenthost:/opt/agent/inbox"
+    drop_via: spine_md
+    launch: "ssh -t agentuser@agenthost '/home/agentuser/.local/bin/agent'"
+    ask_host: "agentuser@agenthost"
+    agent_ssh: "agentuser@agenthost"
+    ask_cmd: "/home/agentuser/.local/bin/agent -z {q} | fold -s -w 76 | pr -to2"
+    followup: resume
+    sid_cmd: "/home/agentuser/.local/bin/agent sessions list --source cli --limit 1 | tail -1 | awk '{print $NF}'"
+    followup_cmd: "/home/agentuser/.local/bin/agent chat -Q --resume {sid} --query-file - | fold -s -w 76 | pr -to2"
+    session_cmd: "/home/agentuser/.local/bin/agent --resume {sid}"
+    health:
+      - what: "agent starts and its credential is present"
+        cmd: "/home/agentuser/.local/bin/agent status"
+        ok: "credential[^\\n]*present"
+    test_cmd: "/home/agentuser/.local/bin/agent -z {q}"
+    paid: true
+    constraints:
+      - "NEVER agent-initiated capture. The user's gesture only."
+
+  # 3. A BRIDGED agent: ask_cmd runs on one host and forwards to the agent on another.
+  #    ask_host ≠ agent_ssh, and the drop must be where the AGENT reads, inside its sandbox.
+  - id: bridged
+    label: Bridged
+    color: "#e06c75"
+    model: "sandboxed-model"
+    vision: false
+    drop: "agentbox:/Users/agent/sandbox/asks"
+    drop_via: auto
+    launch: "ssh -t bridgehost /home/bridge/tools/agent.sh"
+    ask_host: "bridgehost"
+    agent_ssh: "agent@agentbox"
+    ask_cmd: "/usr/bin/env AGENT_STAY=1 /home/bridge/tools/agent.sh -c {q}"
+    followup: native
+    health:
+      - what: "the bridge is up"
+        cmd: "/home/bridge/tools/agent.sh health"
+        ok: "status: up"
+    test_cmd: "/home/bridge/tools/agent.sh -c {q}"
+    agent_timeout: 600
+    constraints:
+      - "Text-only backend. Send the .txt sidecar, never the .png alone."
+
+# ---------------------------------------------------------------------------
+# INTENTS — what you want, not how you grabbed it. The pad's second row and the rofi picker
+# both read these; rewording one touches no code. `capture` is the default grab for that
+# intent; whatever the pad has ARMED always wins over it.
+# ---------------------------------------------------------------------------
+intents:
+  - id: skip
+    label: "skip?"
+    capture: region
+    prompt: >
+      Is this worth engaging with at all? If it is not, say so plainly and tell me
+      to move on -- that is the most useful thing you can tell me and the easiest
+      one to drop. If it IS worth it, say in one line why.
+
+  - id: angle
+    label: "angle?"
+    capture: region
+    prompt: >
+      What angle could I take here that the people already in this thread cannot?
+      Name what someone would have to know, or have actually done, to earn it.
+      If there is no such angle, say so rather than inventing one.
+
+  - id: draft
+    label: "draft"
+    capture: region
+    prompt: >
+      Draft a reply in my voice: direct, specific, no marketing register, no
+      manufactured enthusiasm. Then read your own draft cold and tell me what is
+      wrong with it. Do not defend it.
+
+  - id: research
+    label: "research?"
+    capture: region
+    prompt: >
+      Before answering: what is the context here? Who is talking, what are they
+      actually claiming, and is the claim true? Say what you could NOT establish.
+
+  - id: feedback
+    label: "feedback?"
+    capture: page
+    prompt: >
+      Below is a thread and THE LAST COMMENT IS MINE. Read the post above it first.
+      Then, without rewriting anything:
+      (1) Read my comment cold, as a stranger scrolling past -- what do you think
+          I am saying?
+      (2) I will tell you what I meant; where does it not land?
+      (3) Does it sound like a person who did the thing, or like a brand?
+      (4) Am I picking a fight that costs more than it gains?
+      Diagnose only. If I want it rewritten I will ask for a draft.

@@ -1,0 +1,29 @@
+[Unit]
+Description=mrog notch (top-edge status pills)
+Documentation=https://github.com/Associated2u/notch-pills
+# NOT graphical-session.target: Cinnamon on Mint never activates it (measured
+# 2026-09-04 - it reads "inactive" in a live session), so a unit wired to it is
+# enabled, symlinked, and still never starts at login. default.target is
+# reached on every login. DISPLAY/XAUTHORITY are already in the user manager's
+# environment, but the X server may not be up the instant we are, hence the
+# ExecStartPre wait.
+PartOf=default.target
+After=default.target
+# No restart rate limiting. At boot the X server may not be up when
+# default.target is reached; with the default burst (5 starts / 10 s) the
+# retries get throttled out and the notch simply never appears. These belong in
+# [Unit], NOT [Service] - putting them under [Service] is silently ignored.
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do xdotool getdisplaygeometry >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
+ExecStart=%h/.local/bin/mrog-notch
+Restart=on-failure
+RestartSec=3
+# It is a GTK client on the session's X server; no root, no capabilities.
+PrivateTmp=no
+
+[Install]
+WantedBy=default.target

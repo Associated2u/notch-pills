@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# ask-text — ask the current agent a question with no capture. Opened in a terminal by leader.
+set -uo pipefail
+sel=$(cat "$HOME/.askbar/selected" 2>/dev/null); sel=${sel:-claude}
+echo "Asking: $(~/bin/ask-agent --show)"
+printf 'question> '
+IFS= read -r q
+[ -n "$q" ] || { echo "nothing typed, aborted"; exit 0; }
+"${MROG_ROOT:-$HOME/mrog}/askbar/ask" --to "$sel" --none --text "$q"
+echo; read -rp "press enter to close "

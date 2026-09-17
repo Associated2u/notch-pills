@@ -1,0 +1,72 @@
+#!/bin/bash
+# SID: HERMES-VGE
+# ============================================================================
+#  mrog-wm-check - fallback-WM (metacity) containment verifier.
+#
+#  WHY THIS EXISTS. Measured 2026-09-07 on this machine, in a Xephyr sandbox:
+#  under a window-creation storm the memory does NOT grow in metacity - it grows
+#  in the X SERVER, as compositing redirect pixmaps:
+#       org.gnome.metacity compositor='xrender' -> X server +28.2 MB/s (3871 kB/window)
+#       org.gnome.metacity compositor='none'    -> X server + 2.6 MB/s ( 326 kB/window)
+#  metacity's own RSS grew 0.28 MB/s in BOTH cases. So the containment is the
+#  gsettings key, and this script is what stops that key regressing silently.
+#
+#  🔴 THE TRAP THIS GUARDS: `metacity --compositor=xrender` PERSISTS the value
+#  into gsettings. The CLI flag is not ephemeral - measured twice. So anyone who
+#  debugs metacity with a compositor flag silently re-arms the 11x amplifier.
+#
+#  VERDICT IS THE PRINTED WORD: PASS / FAIL / ERROR. Never read $? - several
+#  tools in this fleet exit 0 on failure.
+#  Read-only. Kills nothing, restarts nothing, touches no display.
+# ============================================================================
+set -u
+WANT="none"
+fail=0
+
+key=$(gsettings get org.gnome.metacity compositor 2>/dev/null | tr -d "'")
+if [ -z "$key" ]; then
+  echo "ERROR  cannot read org.gnome.metacity compositor (schema missing?)"
+  exit 2
+fi
+if [ "$key" = "$WANT" ]; then
+  echo "PASS   compositor=$key  (X-server pixmap amplifier disarmed)"
+else
+  echo "FAIL   compositor=$key  expected '$WANT'  -- the 11x memory amplifier is ARMED"
+  echo "       fix: gsettings set org.gnome.metacity compositor 'none'"
+  fail=1
+fi
+
+# --- live fallback WM, if any. Instantaneous CPU, never ps pcpu (lifetime avg). ---
+CLK=$(getconf CLK_TCK)
+mc=$(ps -eo pid,comm --no-headers | awk '$2=="metacity"{print $1}')
+if [ -z "$mc" ]; then
+  echo "INFO   no metacity running (normal: it is only the fallback WM)"
+else
+  for p in $mc; do
+    a=$(awk '{print $14+$15}' /proc/$p/stat 2>/dev/null) || continue
+    sleep 2
+    b=$(awk '{print $14+$15}' /proc/$p/stat 2>/dev/null) || continue
+    r=$(awk '/^VmRSS:/{print $2}' /proc/$p/status 2>/dev/null)
+    d=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^DISPLAY=//p')
+    pct=$(awk -v x="$b" -v y="$a" -v c="$CLK" 'BEGIN{printf "%.1f", ((x-y)/c)/2*100}')
+    echo "INFO   metacity pid=$p display=${d:-?} cpu_now=${pct}% rss=$((r/1024))MB"
+    over=$(awk -v v="$pct" 'BEGIN{print (v>60)?1:0}')
+    [ "$over" = "1" ] && { echo "FAIL   metacity pid=$p is RUNAWAY at ${pct}% of a core"; fail=1; }
+  done
+fi
+
+# --- X server growth: the thing that actually exhausts RAM ---
+xp=$(ps -eo pid,comm --no-headers | awk '$2=="Xorg"{print $1; exit}')
+if [ -n "$xp" ]; then
+  r1=$(awk '/^VmRSS:/{print $2}' /proc/$xp/status)
+  sleep 3
+  r2=$(awk '/^VmRSS:/{print $2}' /proc/$xp/status)
+  avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+  awk -v r1="$r1" -v r2="$r2" -v av="$avail" -v p="$xp" 'BEGIN{
+    rate=(r2-r1)/3;
+    printf "INFO   Xorg pid=%s rss=%dMB growth=%.0f kB/s", p, r2/1024, rate;
+    if (rate>100) printf "  -> MemAvailable (%dMB) gone in %.0f min", av/1024, (av/rate)/60;
+    printf "\n" }'
+fi
+
+[ "$fail" = "0" ] && echo "VERDICT PASS" || echo "VERDICT FAIL"

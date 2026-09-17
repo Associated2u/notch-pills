@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""win-text — the FULL text of a window, including everything below the fold.
+
+WHY THIS EXISTS. A screenshot captures a viewport. A long thread, a tall article, a chat
+log -- the part you have to scroll to is simply not in the image, and OCR of the image
+cannot invent it. Chris hit this the moment he tried to ask about a real post.
+
+HOW IT AVOIDS SCROLLING. The accessibility layer (AT-SPI) exposes an application's whole
+document tree, not the painted pixels. Firefox reports the entire page -- measured on this
+machine at ~88k characters while the screen held a few thousand. No scrolling, no
+stitching, no OCR, and it never touches the clipboard.
+
+  Requires: toolkit-accessibility true and GTK_MODULES containing atk-bridge. Both are
+  already on (measured 2026-09-06). If accessibility is OFF this prints nothing and says
+  so, rather than returning a plausible fragment -- a partial capture that looks complete
+  is worse than a refusal, because the agent answers confidently about text it never saw.
+
+usage: win-text                 active window, whole document
+       win-text --win ID        that window specifically (no focus race)
+       win-text --stats         sizes only, no content (safe to paste into a log)
+"""
+import subprocess, sys, os, time
+
+def sh(*a):
+    try:
+        return subprocess.run(a, capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return ""
+
+def active_pid_and_name():
+    # An explicit --win removes a real race: the pill spawns this asynchronously, so the
+    # focused window can change between the click and the read, and you would silently
+    # capture the wrong thing. The caller resolves the window ONCE and passes it here.
+    wid = ""
+    if "--win" in sys.argv:
+        i = sys.argv.index("--win")
+        if i + 1 < len(sys.argv):
+            wid = sys.argv[i + 1]
+    if not wid:
+        wid = sh("xdotool", "getactivewindow")
+    if not wid:
+        return None, ""
+    pid = ""
+    out = sh("xprop", "-id", wid, "_NET_WM_PID")
+    if "=" in out:
+        pid = out.split("=")[-1].strip()
+    cls = sh("xprop", "-id", wid, "WM_CLASS")
+    return (int(pid) if pid.isdigit() else None), cls
+
+try:
+    import pyatspi
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi
+except Exception as e:
+    print("ACCESSIBILITY UNAVAILABLE: pyatspi not importable (%s)" % e, file=sys.stderr)
+    sys.exit(3)
+
+# 🔴 CAP EVERY CALL. AT-SPI is FAST when the app answers -- measured 0.1s for a 10,937
+# character page across 536 nodes. The danger is the opposite: an application that does
+# NOT answer blocks each call for the D-Bus default of 25 SECONDS, and the desktop has
+# ~36 accessible apps. That is how `ask --page` blew past 120s and got killed, while the
+# same walk against Firefox finished in a tenth of a second.
+#
+# So the cost here is never "the tree is big"; it is "some app is not listening". Cap the
+# per-call wait, and keep an overall deadline on top of it.
+try:
+    Atspi.set_timeout(1200, 3000)      # per-method ms, per-application ms
+except Exception:
+    pass
+
+DEADLINE = time.time() + float(os.environ.get("WIN_TEXT_TIMEOUT", "12"))
+
+def out_of_time():
+    return time.time() > DEADLINE
+
+DOCS = set()
+for n in ("DOCUMENT_WEB", "DOCUMENT_FRAME", "DOCUMENT_TEXT", "DOCUMENT_EMAIL", "DOCUMENT"):
+    r = getattr(pyatspi.ROLE_NAMES if False else pyatspi, "ROLE_" + n, None)
+    if r is not None:
+        DOCS.add(r)
+
+def texts(node, out, depth=0):
+    if depth > 60 or out_of_time():
+        return
+    try:
+        t = node.queryText().getText(0, -1)
+        if t and t.strip():
+            out.append(t)
+    except NotImplementedError:
+        pass
+    except Exception:
+        pass
+    try:
+        n = node.childCount
+    except Exception:
+        return
+    for i in range(min(n, 2000)):
+        try:
+            c = node.getChildAtIndex(i)
+        except Exception:
+            continue
+        if c is not None:
+            texts(c, out, depth + 1)
+
+def find_docs(node, hits, depth=0):
+    if depth > 40 or len(hits) > 40 or out_of_time():
+        return
+    try:
+        if node.getRole() in DOCS:
+            # 🔴 ONLY THE TAB YOU ARE LOOKING AT. A browser keeps every open tab in the
+            # accessible tree, so an unfiltered walk returned SEVEN documents and 102k
+            # characters -- six of them tabs Chris was not asking about. Handing an agent
+            # six unrelated pages and asking "what is the angle here" is worse than a
+            # screenshot: it answers confidently about the wrong thing.
+            try:
+                st = node.getState()
+                if not (st.contains(pyatspi.STATE_SHOWING)
+                        and st.contains(pyatspi.STATE_VISIBLE)):
+                    return
+            except Exception:
+                pass
+            hits.append(node)
+            return                      # do not descend into a document twice
+    except Exception:
+        pass
+    try:
+        n = node.childCount
+    except Exception:
+        return
+    for i in range(min(n, 500)):
+        try:
+            c = node.getChildAtIndex(i)
+        except Exception:
+            continue
+        if c is not None:
+            find_docs(c, hits, depth + 1)
+
+pid, cls = active_pid_and_name()
+desktop = pyatspi.Registry.getDesktop(0)
+app = None
+for i in range(desktop.childCount):
+    if out_of_time():
+        break
+    try:
+        a = desktop.getChildAtIndex(i)
+    except Exception:
+        continue
+    if a is None:
+        continue
+    try:
+        if pid is not None and a.get_process_id() == pid:
+            app = a
+            break
+    except Exception:
+        pass
+    try:
+        if a.name and cls and a.name.lower() in cls.lower():
+            app = a
+    except Exception:
+        pass
+
+if app is None:
+    print("NO ACCESSIBLE APPLICATION for the active window (pid=%s class=%s)" % (pid, cls),
+          file=sys.stderr)
+    sys.exit(4)
+
+# Prefer the DOCUMENT under the window -- the whole app also carries menus, tab titles and
+# every other open tab, which is noise the agent would have to wade through.
+hits = []
+find_docs(app, hits)
+chunks = []
+if hits:
+    for h in hits:
+        texts(h, chunks)
+    scope = "document x%d" % len(hits)
+else:
+    texts(app, chunks)
+    scope = "whole application (no DOCUMENT role found)"
+
+body = "\n".join(chunks)
+if "--stats" in sys.argv:
+    print("  app        : %s" % app.name)
+    print("  scope      : %s" % scope)
+    print("  chars      : %d" % len(body))
+    print("  lines      : %d" % len(body.splitlines()))
+    print("  text nodes : %d" % len(chunks))
+    sys.exit(0 if body.strip() else 5)
+
+if out_of_time():
+    # Truncated text that LOOKS complete is the dangerous outcome: the agent cannot tell
+    # it is missing the second half and answers confidently about a fragment. Refuse.
+    print("TIMEOUT: gave up after %ss -- an application is not answering accessibility "
+          "calls. Got %d chars, NOT sending a partial capture. Raise WIN_TEXT_TIMEOUT to "
+          "override." % (os.environ.get("WIN_TEXT_TIMEOUT", "12"), len(body)), file=sys.stderr)
+    sys.exit(6)
+
+if not body.strip():
+    print("EMPTY: accessibility returned no text for this window.", file=sys.stderr)
+    sys.exit(5)
+sys.stdout.write(body)

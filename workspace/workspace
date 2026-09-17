@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+# ============================================================================
+#  workspace - drop windows into a layout, or launch a preset into one.
+#
+#  Three layouts, deliberately. Zones are fractions of the monitor's WORK AREA
+#  (Gdk.Monitor.get_workarea), not the raw geometry, so panels are respected
+#  without hard-coding their height.
+#
+#  Placement uses xdotool windowmove/windowsize, which act on the frame, and
+#  un-maximises first - a maximized window silently ignores a move.
+#
+#    workspace list
+#    workspace apply <layout> [--dry-run]      arrange the current windows
+#    workspace launch <layout> [--dry-run]     open the preset into the zones
+#    workspace place <winid> <layout> <zone>   one window into one zone
+#
+#  Runs as chris. No root.
+# ============================================================================
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk
+
+CONFIG = os.path.expanduser("~/.config/mrog/workspaces.json")
+
+# zone = (x, y, w, h) as fractions of the work area
+DEFAULTS = {
+    "split": {
+        "title": "Two side by side",
+        "zones": [[0.0, 0.0, 0.5, 1.0], [0.5, 0.0, 0.5, 1.0]],
+        "launch": ["TERM", "TERM"],
+    },
+    "main": {
+        "title": "Big left, two stacked right",
+        "zones": [[0.0, 0.0, 0.66, 1.0], [0.66, 0.0, 0.34, 0.5], [0.66, 0.5, 0.34, 0.5]],
+        "launch": [None, "TERM", "TERM"],
+    },
+    "quad": {
+        "title": "Four panes",
+        "zones": [[0.0, 0.0, 0.5, 0.5], [0.5, 0.0, 0.5, 0.5],
+                  [0.0, 0.5, 0.5, 0.5], [0.5, 0.5, 0.5, 0.5]],
+        "launch": ["TERM", "TERM", "TERM", "TERM"],
+    },
+}
+
+# What "TERM" means. One window, straight into the work you actually do.
+DEFAULT_TERM = "x-terminal-emulator"   # override `term` in ~/.config/mrog/workspaces.json
+
+
+def load_config():
+    cfg = {"layouts": DEFAULTS, "term": DEFAULT_TERM}
+    try:
+        with open(CONFIG) as f:
+            user = json.load(f)
+        cfg["layouts"] = user.get("layouts", cfg["layouts"])
+        cfg["term"] = user.get("term", cfg["term"])
+    except FileNotFoundError:
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        with open(CONFIG, "w") as f:
+            json.dump({"term": DEFAULT_TERM, "layouts": DEFAULTS}, f, indent=2)
+    except Exception as e:
+        print(f"workspace: {CONFIG} is unreadable ({e}); using defaults", file=sys.stderr)
+    return cfg
+
+
+def monitors():
+    """[(name, Gdk.Monitor)] with the primary first."""
+    disp = Gdk.Display.get_default()
+    pm = disp.get_primary_monitor()
+    out = []
+    for i in range(disp.get_n_monitors()):
+        m = disp.get_monitor(i)
+        out.append((m.get_model() or f"monitor{i}", m))
+    out.sort(key=lambda t: 0 if (pm and t[1] is pm) else 1)
+    return out
+
+
+def pick_monitor(which=None):
+    mons = monitors()
+    if which is None:
+        return mons[0][1]
+    for name, m in mons:
+        if name == which:
+            return m
+    if str(which).isdigit() and int(which) < len(mons):
+        return mons[int(which)][1]
+    die(f"no monitor {which!r} - have: {', '.join(n for n, _ in mons)}")
+
+
+def workarea(which=None):
+    """Usable rectangle of a monitor, panels already subtracted."""
+    a = pick_monitor(which).get_workarea()
+    return (a.x, a.y, a.width, a.height)
+
+
+def zone_rect(zone, area=None, monitor=None):
+    x, y, w, h = area or workarea(monitor)
+    fx, fy, fw, fh = zone
+    return (int(x + fx * w), int(y + fy * h), int(fw * w), int(fh * h))
+
+
+def sh(*a):
+    return subprocess.run(a, capture_output=True, text=True).stdout.strip()
+
+
+def windows():
+    """Normal, movable windows on the current desktop, most recent first."""
+    out = []
+    for line in sh("wmctrl", "-lpG").splitlines():
+        parts = line.split(None, 8)
+        if len(parts) < 9:
+            continue
+        wid, desk = parts[0], parts[1]
+        if desk == "-1":                      # docks, panels, our own pills
+            continue
+        title = parts[8]
+        cls = sh("xprop", "-id", wid, "WM_CLASS")
+        if "notch.py" in title or "mrog-notch" in cls:
+            continue
+        wtype = sh("xprop", "-id", wid, "_NET_WM_WINDOW_TYPE")
+        if "_NET_WM_WINDOW_TYPE_NORMAL" not in wtype and wtype:
+            continue
+        out.append((wid, title))
+    return out
+
+
+def place(wid, rect, dry=False):
+    """`wmctrl -e` is frame-correct: ask for 1957,0 941x1165 and the FRAME lands
+    there, with the client inset by _NET_FRAME_EXTENTS (0,0,32,0 here).
+    Verify with xwininfo - `xdotool getwindowgeometry` reports a different
+    origin for reparented windows and will make a correct placement look wrong."""
+    x, y, w, h = rect
+    if dry:
+        print(f"    would place {wid} at {x},{y} {w}x{h}")
+        return
+    # A maximized window silently ignores a move, so drop those states first.
+    subprocess.run(["wmctrl", "-i", "-r", wid, "-b",
+                    "remove,maximized_vert,maximized_horz"], capture_output=True)
+    subprocess.run(["wmctrl", "-i", "-r", wid, "-e",
+                    f"0,{x},{y},{w},{h}"], capture_output=True)
+
+
+def frame_geom(wid):
+    """(x, y, w, h) of the FRAME, from xwininfo plus _NET_FRAME_EXTENTS."""
+    info = sh("xwininfo", "-id", wid)
+    g = {}
+    for line in info.splitlines():
+        line = line.strip()
+        for key, name in (("Absolute upper-left X:", "x"), ("Absolute upper-left Y:", "y"),
+                          ("Width:", "w"), ("Height:", "h")):
+            if line.startswith(key):
+                g[name] = int(line.split(":")[1])
+    ext = sh("xprop", "-id", wid, "_NET_FRAME_EXTENTS")
+    try:
+        l, r, t, b = [int(v) for v in ext.split("=")[1].split(",")]
+    except Exception:
+        l = r = t = b = 0
+    return (g.get("x", 0) - l, g.get("y", 0) - t,
+            g.get("w", 0) + l + r, g.get("h", 0) + t + b)
+
+
+def cmd_list(cfg):
+    for name, m in monitors():
+        a = m.get_workarea()
+        g = m.get_geometry()
+        dpi = (g.width / (m.get_width_mm() / 25.4)) if m.get_width_mm() else 96
+        print(f"monitor {name}: work area {a.width}x{a.height} at {a.x},{a.y}"
+              f"   ({dpi:.0f} dpi)")
+    ax, ay, aw, ah = workarea()
+    print(f"\nzones below are for the primary ({aw}x{ah} at {ax},{ay})")
+    for name, lay in cfg["layouts"].items():
+        print(f"\n  {name:<7} {lay['title']}  ({len(lay['zones'])} zones)")
+        for i, z in enumerate(lay["zones"]):
+            x, y, w, h = zone_rect(z)
+            print(f"      zone {i}: {w}x{h} at {x},{y}")
+
+
+def cmd_apply(cfg, name, dry, monitor=None):
+    lay = cfg["layouts"].get(name) or die(f"no layout {name!r}")
+    wins = windows()
+    if not wins:
+        die("no ordinary windows to arrange")
+    print(f"{name}: {lay['title']}")
+    for i, z in enumerate(lay["zones"]):
+        if i >= len(wins):
+            print(f"    zone {i}: (no window left)")
+            continue
+        wid, title = wins[i]
+        print(f"    zone {i} <- {title[:44]}")
+        place(wid, zone_rect(z, monitor=monitor), dry)
+
+
+def cmd_launch(cfg, name, dry):
+    lay = cfg["layouts"].get(name) or die(f"no layout {name!r}")
+    print(f"{name}: {lay['title']}")
+    before = {w for w, _ in windows()}
+    spawned = []
+    for i, what in enumerate(lay.get("launch") or []):
+        if not what:
+            continue
+        cmd = cfg["term"] if what == "TERM" else what
+        if dry:
+            print(f"    zone {i}: would run {cmd}")
+            continue
+        subprocess.Popen(["bash", "-lc", cmd], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        spawned.append(i)
+        time.sleep(0.9)                 # let the WM map it before the next one
+    if dry:
+        return
+    # Give the last window a moment, then place whatever is new.
+    time.sleep(1.2)
+    new = [w for w, _ in windows() if w not in before]
+    new.reverse()
+    for i, wid in zip(spawned, new):
+        place(wid, zone_rect(lay["zones"][i]))
+        print(f"    zone {i} <- {wid}")
+
+
+def cmd_place(cfg, wid, name, idx, dry, monitor=None):
+    lay = cfg["layouts"].get(name) or die(f"no layout {name!r}")
+    idx = int(idx)
+    if not (0 <= idx < len(lay["zones"])):
+        die(f"{name} has zones 0..{len(lay['zones']) - 1}")
+    place(wid, zone_rect(lay["zones"][idx], monitor=monitor), dry)
+
+
+def die(msg):
+    print(f"workspace: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("verb", choices=["list", "apply", "launch", "place", "windows", "geom"])
+    ap.add_argument("args", nargs="*")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--monitor", default=None,
+                    help="connector name (eDP-1, DP-2) or index; default primary")
+    a = ap.parse_args()
+    cfg = load_config()
+
+    if a.verb == "list":
+        cmd_list(cfg)
+    elif a.verb == "geom":
+        for wid, t in windows():
+            print(f"  {wid}  {frame_geom(wid)}  {t[:40]}")
+    elif a.verb == "windows":
+        for wid, t in windows():
+            print(f"  {wid}  {t}")
+    elif a.verb == "apply":
+        cmd_apply(cfg, a.args[0] if a.args else "split", a.dry_run, a.monitor)
+    elif a.verb == "launch":
+        cmd_launch(cfg, a.args[0] if a.args else "split", a.dry_run)
+    elif a.verb == "place":
+        if len(a.args) < 3:
+            die("place <winid> <layout> <zone>")
+        cmd_place(cfg, a.args[0], a.args[1], a.args[2], a.dry_run, a.monitor)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# mrog-notch-trial — launch the panel on the REAL display with a deadman timer.
+#
+# Exactly the shape of a graphical display-settings change: the new state goes live, and
+# if you do not confirm within the window, it REVERTS BY ITSELF.
+#
+# 🎯 WHY DOING-NOTHING IS THE SAFE PATH. If a bad input shape or a stuck grab freezes the
+# desktop, Chris cannot click a "keep this?" dialog -- a GUI confirm is useless precisely
+# when it is needed. So the default is REVERT, and confirming is the action that requires a
+# working desktop. A freeze therefore heals itself in TIMEOUT seconds without him touching
+# anything, and without an agent SSHing in to kill things.
+#
+# 🔴 THE REVERT BREAKS GRABS FIRST, THEN STOPS THE PANEL, AND NEVER TOUCHES THE COMPOSITOR.
+# Killing Cinnamon is what cost a desktop on 2026-09-06: mrog-unfreeze saw a runaway shell
+# and shot it, metacity took the root window, and Cinnamon could not get it back. This
+# script stops ONE service and sends one ungrab. Nothing else.
+#
+# usage: mrog-notch-trial [SECONDS]   default 60
+#        mrog-notch-trial keep        keep it (cancels the revert)
+#        mrog-notch-trial revert      revert right now
+set -uo pipefail
+RUN="$HOME/.mrog-trial"; mkdir -p "$RUN"
+KEEP="$RUN/keep"; WPID="$RUN/watchdog.pid"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+NOTIF_ID=4242          # fixed: every message from this script REPLACES the last one
+say() {
+  command -v notify-send >/dev/null 2>&1 || return 0
+  # never critical -- see the note above. -t is an expiry, so an unattended message clears
+  # itself instead of waiting for a human who may be looking at a frozen screen.
+  notify-send -r "$NOTIF_ID" -t 8000 "$@" >/dev/null 2>&1
+}
+
+revert() {
+  # 1. grabs first -- a wedged grab is what makes a desktop look dead, and it survives
+  #    everything short of an ungrab or the grabbing client exiting.
+  DISPLAY="${DISPLAY:-:0}" xdotool key XF86Ungrab >/dev/null 2>&1
+  # 2. stop exactly one service. No pkill by pattern, no compositor, no session.
+  timeout 20 systemctl --user stop mrog-notch >/dev/null 2>&1
+  say "notch reverted" "Not confirmed in time — the panel was stopped. Your desktop is untouched."
+  echo "  REVERTED: panel stopped, grabs broken, compositor untouched."
+}
+
+case "${1:-}" in
+keep)
+  : > "$KEEP"
+  p="$(cat "$WPID" 2>/dev/null)"; [ -n "$p" ] && kill -TERM "$p" 2>/dev/null
+  rm -f "$WPID"
+  say -u low "notch kept" "Trial confirmed. The panel stays up."
+  echo "  KEPT — the panel stays up. Nothing will revert it."
+  exit 0 ;;
+revert)
+  p="$(cat "$WPID" 2>/dev/null)"; [ -n "$p" ] && kill -TERM "$p" 2>/dev/null
+  rm -f "$WPID"; revert; exit 0 ;;
+esac
+
+T="${1:-60}"
+case "$T" in ''|*[!0-9]*) echo "  SECONDS must be a number"; exit 2;; esac
+
+# Refuse to stack trials -- two watchdogs would fight over one service.
+p="$(cat "$WPID" 2>/dev/null)"
+if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+  echo "  a trial is already running (watchdog $p). 'keep' or 'revert' it first."; exit 1
+fi
+
+# 🔴 A DISABLED PILL IS INVISIBLE STATE THAT LIVES IN NO FILE.
+# `systemctl --user set-environment MROG_NOTCH_ASKPILL=0` persists in the user MANAGER for
+# the life of the login. It is in no unit, no drop-in, no .profile -- grep finds nothing --
+# and every service restart silently inherits it. That is exactly how the ASK pill was
+# missing for a whole session while the code was correct and the sandbox showed it working.
+# So: say so, every launch, before starting anything.
+off=""
+while IFS= read -r line; do
+  case "$line" in
+    MROG_NOTCH_*=0) off="$off ${line%%=*}" ;;
+  esac
+done < <(timeout 10 systemctl --user show-environment 2>/dev/null)
+if [ -n "$off" ]; then
+  echo
+  echo "  WARNING — these pills are switched OFF in the systemd user environment:"
+  for v in $off; do echo "      $v=0     re-enable: systemctl --user unset-environment $v"; done
+  echo "  They live in NO FILE. They persist until you unset them or log out."
+  echo
+fi
+
+rm -f "$KEEP"
+timeout 20 systemctl --user start mrog-notch || { echo "  FAILED to start mrog-notch"; exit 1; }
+
+# Detached, so it outlives this shell AND any SSH connection. A watchdog that dies with the
+# terminal that started it is not a watchdog.
+setsid nohup bash -c '
+  KEEP="'"$KEEP"'"; T='"$T"'
+  for i in $(seq 1 "$T"); do
+    [ -e "$KEEP" ] && exit 0
+    sleep 1
+  done
+  [ -e "$KEEP" ] && exit 0
+  export XDG_RUNTIME_DIR="'"$XDG_RUNTIME_DIR"'"
+  export DBUS_SESSION_BUS_ADDRESS="'"$DBUS_SESSION_BUS_ADDRESS"'"
+  DISPLAY="'"${DISPLAY:-:0}"'" xdotool key XF86Ungrab >/dev/null 2>&1
+  timeout 20 systemctl --user stop mrog-notch >/dev/null 2>&1
+  command -v notify-send >/dev/null 2>&1 && notify-send -r 4242 -t 8000 "notch reverted" \
+    "Not confirmed in ${T}s — panel stopped. Desktop untouched."
+' >"$RUN/watchdog.log" 2>&1 </dev/null &
+echo $! > "$WPID"
+
+say -u normal "notch trial" "Panel up for ${T}s. Run: mrog-notch-trial keep"
+cat <<EOF
+
+  Panel is UP on trial for ${T} seconds.
+
+  If it looks right:   mrog-notch-trial keep
+  If anything is off:  mrog-notch-trial revert
+  If it FREEZES:       do nothing. It reverts by itself in ${T}s.
+
+EOF

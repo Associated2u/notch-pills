@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# askpill-pos — nudge the ASK pill left/right without a redeploy.
+#
+# The neighbours are CONTENT-sized: the system pill grows with sensors and GPU, LAYOUTS with
+# its label. Their real widths are not knowable from inside the ask pill, so its fraction is
+# tuned by eye rather than computed. 0.38 landed on the system pill; 0.30 landed on LAYOUTS.
+#
+#   askpill-pos            show the current value
+#   askpill-pos 0.335      set it and restart the panel
+#   askpill-pos --left     nudge 0.01 left      --right  nudge 0.01 right
+set -uo pipefail
+cur=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^ASKPILL_FRAC=//p'); cur=${cur:-0.335}
+case "${1:-}" in
+  "")       echo "ASKPILL_FRAC=$cur"; exit 0 ;;
+  --left)   new=$(python3 -c "print(round($cur-0.01,3))") ;;
+  --right)  new=$(python3 -c "print(round($cur+0.01,3))") ;;
+  *)        new="$1" ;;
+esac
+python3 -c "
+v=float('$new')
+raise SystemExit(0 if 0.05 <= v <= 0.95 else 1)" || { echo "out of range: $new"; exit 1; }
+systemctl --user set-environment ASKPILL_FRAC="$new"
+systemctl --user restart mrog-notch
+echo "ASKPILL_FRAC=$new (panel restarted)"

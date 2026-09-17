@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# ask-pick — the fast path. Pick what you want, then grab it, then it sends.
+#
+# WHY THE PICKER COMES FIRST. The first pad welded capture to send: clicking "region"
+# captured AND fired, so there was no moment between grabbing something and committing it.
+# Here the ORDER is the safety: choose the intent, and the region-select that follows IS the
+# commit -- Esc during it cancels the whole thing and nothing is sent.
+#
+# rofi because `leader` already uses it (Super+Space), so the muscle memory exists. zenity is
+# the fallback, same as leader does it.
+#
+# 🎯 ONE ENTRY POINT, TWO CALLERS. The ASK pad calls this with the intent AND the mode it has
+# armed; the keybind calls it bare and gets the picker. Building a second near-identical
+# script for the pad is how the pad's menu and the picker's menu drift apart -- the exact
+# transcribed-copy failure this fleet keeps evicting. One script, one registry read.
+#
+# usage: ask-pick                        pick an intent, then capture in its default mode
+#        ask-pick skip                   that intent, its default mode
+#        ask-pick angle window           that intent, mode FORCED to window
+#        ask-pick - region -- some text  no preset; just the text, plus a region grab
+set -uo pipefail
+export PATH="$HOME/bin:/usr/local/bin:$PATH"
+# 🔴 EVERY NOTIFICATION HERE CARRIES A FIXED REPLACE-ID so this tool can only ever own ONE
+# on screen. Without it, repeated runs QUEUE: you dismiss the top one and the next appears,
+# which reads as a notification that will not go away. That happened on 2026-09-06 with
+# mrog-notch-trial and cost real confusion. A critical one never expires by spec, so a stack
+# of them is permanent until each is dismissed by hand.
+# REFUSED stays `critical` and stays until dismissed deliberately -- it means a capture
+# looked like it held a credential, and that must not quietly fade. It just cannot stack.
+NID=4243
+note() { command -v notify-send >/dev/null 2>&1 && notify-send -r "$NID" "$@" >/dev/null 2>&1; }
+
+ASK="${MROG_ROOT:-$HOME/mrog}/askbar/ask"
+SEL="$HOME/.askbar/selected"
+agent="$(cat "$SEL" 2>/dev/null)"; agent="${agent:-claude}"
+
+pick_id=""; mode_override=""; text=""
+if [ $# -ge 1 ] && [ "$1" != "--" ]; then pick_id="$1"; shift; fi
+if [ $# -ge 1 ] && [ "$1" != "--" ]; then mode_override="$1"; shift; fi
+[ "${1:-}" = "--" ] && { shift; text="$*"; }
+
+# id \t label \t default capture mode -- all three from the registry, so rewording an intent
+# or adding one never touches this file.
+mapfile -t rows < <("$ASK" --intents 2>/dev/null)
+[ "${#rows[@]}" -gt 0 ] || { note -u critical -t 20000 "ask" "no intents in the registry"; exit 1; }
+
+choose() {
+  local menu="" r
+  for r in "${rows[@]}"; do menu+="$(printf '%s' "$r" | cut -f2)"$'\n'; done
+  menu+="custom…"
+  if command -v rofi >/dev/null 2>&1; then
+    printf '%s' "$menu" | rofi -dmenu -i -p "ask ${agent}" -no-custom
+  elif command -v zenity >/dev/null 2>&1; then
+    printf '%s' "$menu" | zenity --list --title="ask $agent" --column=intent 2>/dev/null
+  else
+    printf '%s' "$menu" | head -1
+  fi
+}
+
+if [ -z "$pick_id" ]; then
+  label="$(choose)"
+  [ -n "$label" ] || exit 0                     # Esc = cancelled, nothing captured, nothing sent
+  if [ "$label" = "custom…" ]; then
+    # Typing belongs in a box, not in a menu. The pad is still the place for a real question.
+    exec "$HOME/bin/ask-text"
+  fi
+  for r in "${rows[@]}"; do
+    [ "$(printf '%s' "$r" | cut -f2)" = "$label" ] && { pick_id="$(printf '%s' "$r" | cut -f1)"; break; }
+  done
+  [ -n "$pick_id" ] || exit 0
+fi
+
+# "-" is the no-preset path: Enter in the pad with something typed. A bare "-" with no text
+# would send an empty question, so refuse it rather than waste a capture on nothing.
+if [ "$pick_id" = "-" ]; then
+  [ -n "$text" ] || { note -u normal -t 6000 "ask" "nothing typed — no preset, no question"; exit 0; }
+  mode="${mode_override:-none}"
+else
+  mode="$mode_override"
+  if [ -z "$mode" ]; then
+    for r in "${rows[@]}"; do
+      [ "$(printf '%s' "$r" | cut -f1)" = "$pick_id" ] && mode="$(printf '%s' "$r" | cut -f3)"
+    done
+  fi
+  mode="${mode:-region}"
+fi
+
+# feedback judges YOUR comment, which is meaningless without the post it answers. Say so
+# before the region-select rather than after, when the grab is already wrong.
+# feedback? judges YOUR comment, which is meaningless without the post it answers. In page
+# mode the whole document is already there and there is nothing to aim at -- telling you to
+# "select the whole thread" when no selection is coming would be a lie that costs a second
+# of confusion every single time.
+if [ "$pick_id" = feedback ] && [ "$mode" != none ] && [ "$mode" != page ] \
+   && command -v notify-send >/dev/null 2>&1; then
+  note -u normal -t 9000 "feedback?" "Select the WHOLE thread — the post above and your comment. Judging your reply alone is arguing with something invisible."
+  sleep 1
+fi
+
+args=("$ASK" --to "$agent" "--$mode" --open)
+[ "$pick_id" != "-" ] && args+=(--intent "$pick_id")
+[ -n "$text" ] && args+=(--text "$text")
+
+out="$("${args[@]}" 2>&1)"
+verdict="$(printf '%s' "$out" | head -1)"
+if command -v notify-send >/dev/null 2>&1; then
+  case "$verdict" in
+    OK*)      note -u low      -t 5000 "ask → $agent" "$pick_id sent" ;;
+    # 🔴 SAY WHICH REFUSAL. `ask` emits REFUSED for TWO unrelated reasons -- a stale X-grab
+    # holder (ask:184) and the secret scan (ask:295) -- and this line used to report BOTH as
+    # "looked like it held a credential". Chris saw a run of credential warnings on captures
+    # that contained no credential; the real cause was a capture tool still running. Same
+    # collapse-two-failures-into-one-word defect the rest of this tree keeps finding.
+    # 🔴 FIRST LINE ONLY, DELIBERATELY. Line 2 of the secret-scan refusal is "matched: <text>"
+    # -- the credential itself. A desktop notification is persisted and logged, so widening
+    # this to two lines would leak the very thing the refusal exists to protect.
+    REFUSED*) note -u critical "ask REFUSED"  "${verdict#REFUSED — }" ;;
+    *)        note -u normal   -t 12000 "ask failed"   "$verdict" ;;
+  esac
+fi
+printf '%s\n' "$out"

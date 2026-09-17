@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# ask-selftest-cron — the ONE place allowed to turn ask-selftest's printed WORD into an exit
+# status, and it exists only because systemd's OnFailure= has no other way to hear.
+#
+# 🔴 WHY THIS FILE EXISTS AT ALL, AND WHY THE CONVERSION IS HERE AND NOWHERE ELSE.
+# The fleet rule is "match the printed word, never the exit code" -- six bugs, most recently
+# freeze_table.sh --check, whose codes are INVERTED so that `if freeze_table.sh --check; then
+# restart; fi` restarts exactly when it must not. ask-selftest therefore always exits 0 and
+# says what it means in words. But a systemd unit can only fail by exiting non-zero, so the
+# translation has to happen somewhere. Putting it in ONE short visible script, rather than
+# inside the checker, keeps the rule intact: the checker still cannot lie through $?, and
+# anyone auditing the conversion has four lines to read instead of five hundred.
+#
+# 🔴 IT FAILS CLOSED IN BOTH DIRECTIONS. FAIL, ERROR, and -- critically -- a MISSING verdict
+# line (the checker crashed, was killed, ran out of disk) all exit 1 and raise the alarm.
+# Silence is never read as health. A SKIP also alerts: a SKIP in the scheduled run means some
+# route is NOT BEING CHECKED, and "nothing is checking it" is precisely the condition that let
+# three routes stay dead for a day.
+#
+# 🔴 EXACTLY ONE WORD BESIDES PASS EXITS 0, AND IT HAD TO EARN IT: BLOCKED.
+# A route that is wired correctly and waiting on a HUMAN is not broken, and popping a critical
+# notification about it three times a day is how Chris learns to dismiss the notification that
+# matters. This is the same reasoning the timer already uses to stay out of 22:25-03:05: an
+# alert that cries wolf is worse than no alert.
+# It is NOT a mute button, and the safeguard is not in this file -- it is in the registry.
+# _regcheck.py refuses a `blocked_on:` that carries no `blocked_since:` date, and ask-selftest
+# escalates a blocked probe back to FAIL once it is past its grace period (default 14 days).
+# So the silence is bounded by a clock nobody has to remember to wind.
+#
+# Verdict is still the printed WORD; this script prints it too. The exit status is for systemd.
+set -uo pipefail
+SELFTEST="${ASKBAR_SELFTEST:-${MROG_ROOT:-$HOME/mrog}/askbar/ask-selftest}"
+# 🔴 OVERRIDABLE FOR THE SAME REASON ask-selftest._persist redirects its log: proving that
+# this wrapper still converts the WORD correctly means running it against stand-in checkers
+# that announce chosen verdicts, and every one of those runs used to overwrite the very file
+# the notifier reads to name the failing routes. Proving the alarm works would have made the
+# next alarm name the wrong routes.
+STATE="${ASKBAR_STATUS:-$HOME/.askbar/selftest-status}"
+mkdir -p "$HOME/.askbar" 2>/dev/null
+
+if [ ! -x "$SELFTEST" ]; then
+  printf '%s\tMISSING\tno executable ask-selftest at %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SELFTEST" > "$STATE"
+  echo "SELFTEST VERDICT: MISSING — no executable checker at $SELFTEST"
+  exit 1
+fi
+
+out="$("$SELFTEST" "$@" 2>&1)"
+printf '%s\n' "$out"
+
+# sed -n 's/^...//p' | tail -1: take the LAST verdict line, so a stray earlier match cannot
+# outrank the real one. An empty result means the checker never got to print a verdict.
+verdict="$(printf '%s\n' "$out" | sed -n 's/^SELFTEST VERDICT: //p' | tail -1)"
+[ -n "$verdict" ] || verdict="MISSING"
+printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$verdict" > "$STATE"
+
+case "$verdict" in
+  PASS)    exit 0 ;;
+  BLOCKED) echo "     (BLOCKED is not PASS: some route is waiting on Chris. No critical alert"
+           echo "      is raised for it, and it escalates itself to FAIL past its grace period.)"
+           exit 0 ;;
+  *)       exit 1 ;;
+esac

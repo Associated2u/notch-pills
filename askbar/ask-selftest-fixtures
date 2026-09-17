@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# ask-selftest-fixtures — prove the CHECKER still catches things, on deliberately broken COPIES
+# of the registry. The live agents.yml is only ever READ.
+#
+# 🔴 WHY THIS EXISTS. CLAUDE.md Rule 8 clause 4: a check observed only PASSING is not verified.
+# ask-selftest is the thing that is supposed to notice when a route dies, so "is ask-selftest
+# still able to notice?" is a question that needs its own answer, and needs it repeatably --
+# not once, by hand, on the day it was written. Run this after ANY edit to ask-selftest,
+# agents.yml or _regcheck.py.
+#
+# THE FAILURE CLASS IT COVERS (clause 5): "ask-selftest reports PASS for a route that cannot
+# work." Each case below is a route that cannot work, for a different reason, and the case
+# passes only when the checker says so IN THE RIGHT PLACE -- a FAIL on the wrong line would
+# mean the checker is right by accident.
+#
+# Verdict is the printed WORD. Last line: FIXTURES VERDICT: PASS / FAIL.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FX="${ASKBAR_FIXTURES:-$HOME/.askbar/_vge3}"
+FX4="${ASKBAR_FIXTURES4:-$HOME/.askbar/_vge4}"
+LIVE="$HERE/agents.yml"
+# FLEET-V26: the fixtures exercise ONE row of the live registry; name it here, not in every case.
+FXA="${ASKBAR_FIXTURE_AGENT:-dreamzs}"
+FULL=0
+[ "${1:-}" = "--full" ] && FULL=1
+
+# 🔴 REBUILD FROM LIVE FIRST, ALWAYS. On 2026-09-07 the stage-3 fixtures were still copies of a
+# registry from before `agent_ssh` existed, so five of them failed at `shape` and stopped
+# exercising the legs they were written for -- while the suite dutifully reported those as FAIL
+# without anyone knowing the fixture, not the checker, was the stale thing. Regenerating from
+# the live file every run removes the whole failure mode.
+if [ -x "$FX4/mk.sh" ]; then "$FX4/mk.sh" >/dev/null 2>&1 || echo "WARNING: fixture rebuild failed"; fi
+
+live_before="$(sha256sum "$LIVE" | cut -d' ' -f1)"
+pass=0; fail=0
+
+# case <label> <registry> <extra args> <regex the output MUST match>
+case_run() {
+  local label="$1" reg="$2" args="$3" want="$4"
+  local out
+  out="$("$HERE/ask-selftest" --registry "$reg" $args 2>&1)"
+  if printf '%s' "$out" | grep -qE "$want"; then
+    printf 'PASS  %-34s (matched: %s)\n' "$label" "$want"; pass=$((pass+1))
+  else
+    printf 'FAIL  %-34s (expected /%s/ and did not get it)\n' "$label" "$want"; fail=$((fail+1))
+    printf '%s\n' "$out" | sed -n '/^route/,$p' | sed 's/^/        /' | head -12
+  fi
+}
+
+echo "ask-selftest-fixtures  $(date -u +%Y-%m-%dT%H:%M:%SZ)  fixtures=$FX"
+echo
+
+# --- CLASS A: the checker must catch a route that cannot even start -------------------------
+case_run "ghost command -> cmd-resolve"   "$FX/ghostcmd.yml"   "--only claude"  '^  cmd-resolve  FAIL'
+case_run "dead hop -> cmd-resolve"        "$FX/deadhop.yml"    "--only claude"  '^  cmd-resolve  FAIL'
+case_run "dead hop -> drop-reach"         "$FX/deadhop.yml"    "--only claude"  '^  drop-reach   FAIL'
+case_run "missing drop dir -> drop-reach" "$FX/dropgone.yml"   "--only claude"  '^  drop-reach   FAIL'
+case_run "quoted vision -> shape"         "$FX/visionstr.yml"  "--only hermes"  '^  shape        FAIL'
+case_run "self-matching probe -> ERROR"   "$FX/selfprobe.yml"  "--only claude"  '^  cmd-health   ERROR'
+# --- the healthy control. Without this the suite would pass by always saying FAIL. -----------
+case_run "healthy row -> ROUTE PASS"      "$LIVE"              "--only $FXA" "^  ROUTE $FXA +PASS"
+
+# --- STAGE 4 (2026-09-07). Each case is a route that cannot work, or a checker claim that
+# --- must not be believed, and each must FAIL ON THE RIGHT LINE -- a FAIL somewhere else means
+# --- the checker is right by accident. Fixtures are rebuilt from the live registry first, so
+# --- they can never drift away from the thing they are supposed to be a broken copy of.
+echo
+echo "--- stage 4: agent-side drop, the codex class, the blocked clock, path fidelity ---"
+# A5. THE 2026-09-07 F2 BUG, AND THE POINT IS THE THREE LINES ABOVE IT THAT STILL SAY PASS:
+# a drop that lands on a different machine than the agent reads on used to be invisible to
+# every cheap check, and cost an LLM round trip to see.
+case_run "wrong machine -> drop-agentside"   "$FX4/a5_wrongbox.yml"  "--only $FXA" '^  drop-agentside FAIL'
+case_run "wrong machine -> drop-reach STILL PASS" "$FX4/a5_wrongbox.yml" "--only $FXA" '^  drop-reach   PASS'
+case_run "agent cannot read drop -> agentside" "$FX4/a5_unreadable.yml" "--only hermes" '^  drop-agentside FAIL'
+# A4. THE CODEX CLASS: the binary resolves, --version exits 0, every real call dies -- also
+# exiting 0. cmd-resolve must PASS and cmd-health must FAIL, or the two are not separate checks.
+case_run "crashes on real call -> cmd-health" "$FX4/a4_crasher.yml"  "--only $FXA" '^  cmd-health   FAIL'
+case_run "crashes on real call -> resolve PASS" "$FX4/a4_crasher.yml" "--only $FXA" '^  cmd-resolve  PASS'
+# BLOCKED is a state with an expiry, not a mute button.
+case_run "blocked, in grace -> BLOCKED"      "$LIVE"                 "--only codex" '^  ROUTE codex .*BLOCKED'
+case_run "blocked, stale clock -> FAIL"      "$FX4/blocked_stale.yml" "--only codex" '^  ROUTE codex .*FAIL'
+# CLASS B WITHOUT SPENDING A PENNY. Three stand-in agents, each with a different habit.
+case_run "path follower -> round-trip PASS"  "$FX4/b_follower.yml"   "--full --only $FXA" '^  round-trip   PASS'
+case_run "directory scanner -> PATH FIDELITY FAILED" "$FX4/b_scanner.yml" "--full --only $FXA" 'PATH FIDELITY FAILED'
+case_run "bluffer -> round-trip FAIL"        "$FX4/b_bluffer.yml"    "--full --only $FXA" '^  round-trip   FAIL'
+# A BLOCKED route must not be round-tripped at all: the trip would re-discover the block, report
+# it as FAIL, and FAIL outranks BLOCKED -- collapsing the third state back into the second.
+# Measured live 2026-09-07 on codex and continue. `continue` was retired the same day
+# (vendor-side TLS failure, see agents.yml history), so codex is now the subject.
+case_run "blocked route -> NO round trip"    "$LIVE"                 "--full --only codex" '^  round-trip   BLOCKED'
+case_run "blocked route stays BLOCKED"       "$LIVE"                 "--full --only codex" '^  ROUTE codex .*BLOCKED'
+
+if [ "$FULL" -eq 1 ]; then
+  echo
+  echo "--- CLASS B (spends local-hardware LLM calls on $FXA; no metered account) ---"
+  # The 2026-09-07 F2 bug exactly: file lands on Hub, agent runs on GpuBox. EVERY class A
+  # check passes; only the round trip can see it. This is the case that proves the two classes
+  # are genuinely separate rather than two names for one check.
+  case_run "wrong machine -> round-trip"  "$FX/wrongbox.yml"   "--full --only $FXA" '^  round-trip   FAIL'
+  case_run "wrong machine -> class A all PASS" "$FX/wrongbox.yml" "--full --only $FXA" '^  cmd-health   PASS'
+  case_run "healthy -> round-trip PASS"   "$LIVE"              "--full --only $FXA" '^  round-trip   PASS'
+fi
+
+live_after="$(sha256sum "$LIVE" | cut -d' ' -f1)"
+echo
+if [ "$live_before" = "$live_after" ]; then
+  echo "live registry UNTOUCHED  sha=$live_after"
+else
+  echo "🔴 LIVE REGISTRY CHANGED DURING THE RUN  before=$live_before after=$live_after"
+  fail=$((fail+1))
+fi
+echo "SUMMARY  cases=$((pass+fail))  PASS=$pass  FAIL=$fail"
+if [ "$fail" -eq 0 ]; then echo "FIXTURES VERDICT: PASS"; else echo "FIXTURES VERDICT: FAIL"; fi

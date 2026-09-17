@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""~/mrog/mrog-notch-watch -- watch the notch, Xorg and Cinnamon while the pills
+are up, and shout BEFORE the desktop dies.
+
+WHY. FLEET-CB2 2026-09-05. The notch is the prime suspect for Chris's desktop
+freezes: three consecutive instantaneous samples at 100% CPU, Xorg dragged to
+54%, Cinnamon stepping +100 MB at the moment of the freeze. It was turned off as
+a controlled experiment. Turning it back on without a recorder just re-runs the
+experiment with no instrument.
+
+CPU here is a REAL instantaneous rate: a delta of utime+stime from /proc/PID/stat
+over the sample interval, divided by clock ticks. `ps %CPU` is cputime/elapsed
+since process start -- a lifetime average -- and reading it as "right now" is
+what sent me chasing the wrong process twice already.
+
+Cinnamon's RSS is logged because the evidence says it moves in STEPS, not a slow
+leak: flat 249 MB for twenty minutes, then +100 MB in one sample at the freeze.
+A leak check that looks for a gradient will not see that.
+
+Output is one timestamped file, appended and flushed every line, because a
+report about a freeze has to survive the freeze.
+"""
+import os, sys, time, subprocess
+
+HZ       = os.sysconf("SC_CLK_TCK")
+PAGE     = os.sysconf("SC_PAGE_SIZE")
+INTERVAL = 3.0
+# Trip thresholds. CPU: two consecutive samples over 60% is the shape that
+# preceded the freeze -- one spike is a redraw, a sustained pin is a runaway.
+CPU_TRIP, CPU_RUN = 60.0, 2
+RSS_STEP_MB       = 50      # a single-sample jump this large in Cinnamon
+
+OUT = os.path.join(os.path.expanduser(os.environ.get("MROG_ROOT", "~/mrog")), "audit/notch-watch-%s.log"
+                         % time.strftime("%Y%m%dT%H%M%S"))
+os.makedirs(os.path.dirname(OUT), exist_ok=True)
+log = open(OUT, "a", buffering=1)
+
+
+def say(s):
+    line = "%s  %s" % (time.strftime("%H:%M:%S"), s)
+    log.write(line + "\n")
+    print(line, flush=True)
+
+
+def notify(msg, urgency="critical"):
+    try:
+        subprocess.run(["notify-send", "-a", "mrog", "-u", urgency,
+                        "-i", "dialog-warning", "Notch watch", msg],
+                       timeout=5, check=False)
+    except Exception:
+        pass
+
+
+def find_pids():
+    """Resolve each target every sample -- the notch may not exist yet, and it
+    restarts under Restart=on-failure with a new PID."""
+    out = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            cmd = open("/proc/%s/cmdline" % pid, "rb").read().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        if "mrog-notch" in cmd and "notch-watch" not in cmd and "bash" not in cmd:
+            out.setdefault("notch", pid)
+        elif "/Xorg" in cmd or cmd.startswith("Xorg"):
+            out.setdefault("Xorg", pid)
+        else:
+            # The Cinnamon SHELL on Mint is literally `cinnamon --replace` --
+            # cinnamon-launcher execs it that way, every time. My first filter
+            # excluded --replace as if it were a one-off restart, so the shell
+            # was never matched and the column that carries the key evidence
+            # (RSS steps) silently read "--" forever. Match on argv[0]'s
+            # basename instead, and exclude the helpers by name.
+            argv0 = cmd.split(" ")[0]
+            if os.path.basename(argv0) == "cinnamon":
+                out.setdefault("cinnamon", pid)
+    return out
+
+
+def stat(pid):
+    """(cpu_ticks, rss_mb) or None if the process is gone."""
+    try:
+        f = open("/proc/%s/stat" % pid).read()
+        rp = f.rindex(")") + 2
+        v = f[rp:].split()
+        return int(v[11]) + int(v[12]), int(v[21]) * PAGE / 1048576.0
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+say("=== notch watch started, interval %.0fs, trip %.0f%% x%d ==="
+    % (INTERVAL, CPU_TRIP, CPU_RUN))
+say("log: %s" % OUT)
+
+prev, runs, last_rss, tripped = {}, {}, {}, set()
+try:
+    while True:
+        t0 = time.time()
+        pids, row = find_pids(), []
+        for name in ("notch", "Xorg", "cinnamon"):
+            pid = pids.get(name)
+            if pid is None:
+                row.append("%s=--" % name)
+                prev.pop(name, None)
+                continue
+            s = stat(pid)
+            if s is None:
+                row.append("%s=gone" % name)
+                continue
+            ticks, rss = s
+            key = (name, pid)
+            cpu = None
+            if prev.get(name, (None,))[0] == key:
+                dt = t0 - prev[name][2]
+                if dt > 0:
+                    cpu = (ticks - prev[name][1]) / HZ / dt * 100.0
+            prev[name] = (key, ticks, t0)
+
+            row.append("%s=%s%%/%.0fMB" % (name, "%.0f" % cpu if cpu is not None else "?", rss))
+
+            # --- CPU runaway -------------------------------------------------
+            if cpu is not None and cpu >= CPU_TRIP:
+                runs[name] = runs.get(name, 0) + 1
+                if runs[name] == CPU_RUN and name not in tripped:
+                    tripped.add(name)
+                    say("*** RUNAWAY: %s pid %s held >=%.0f%% for %d samples "
+                        "(now %.0f%%) ***" % (name, pid, CPU_TRIP, CPU_RUN, cpu))
+                    notify("%s is pinned at %.0f%%. This is the shape that "
+                           "preceded the freeze -- ~/bin/mrog-pills off"
+                           % (name, cpu))
+            else:
+                if runs.get(name):
+                    runs[name] = 0
+                tripped.discard(name)
+
+            # --- RSS step ---------------------------------------------------
+            if name in last_rss and rss - last_rss[name] >= RSS_STEP_MB:
+                say("*** RSS STEP: %s +%.0f MB in one sample (%.0f -> %.0f) ***"
+                    % (name, rss - last_rss[name], last_rss[name], rss))
+                notify("%s jumped +%.0f MB in one sample."
+                       % (name, rss - last_rss[name]))
+            last_rss[name] = rss
+
+        say("  ".join(row))
+        time.sleep(max(0.0, INTERVAL - (time.time() - t0)))
+except KeyboardInterrupt:
+    say("=== stopped ===")

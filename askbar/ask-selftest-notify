@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# ask-selftest-notify — put an Ask Bar route failure in front of Chris, on the machine he is
+# sitting at. Wired as askbar-selftest.service's OnFailure=, mirroring the lane the laptop
+# already uses for the laptop-backup (laptop-backup-failed.service -> notify-send -u
+# critical). Existing lane, not a new one.
+#
+# It prints what it sent, so the alert can be proven to fire without anyone having to watch a
+# screen: an alert that has never fired is not an alert.
+set -uo pipefail
+LOG="$HOME/.askbar/selftest.log"
+STATE="$HOME/.askbar/selftest-status"
+
+verdict="$(cut -f2 "$STATE" 2>/dev/null | tail -1)"
+summary="$(sed -n 's/^SUMMARY  //p' "$LOG" 2>/dev/null | tail -1)"
+# Name the routes, not just the count -- "2 FAIL" sends him hunting, "codex, continue" does not.
+bad="$(sed -n 's/^  ROUTE \([a-z0-9_-]*\) *\(FAIL\|ERROR\|SKIP\).*/\1/p' "$LOG" 2>/dev/null | paste -sd,)"; bad="${bad//,/, }"
+# 🔴 BLOCKED ROUTES ARE NAMED SEPARATELY AND NEVER IN THE TITLE. A route waiting on Chris is not
+# "DOWN", and putting it in the headline is how the one genuinely broken route gets skimmed past.
+# It still appears in the BODY, because a blocked route he has forgotten about is the next
+# silent outage -- it is just not the thing being shouted about.
+blk="$(sed -n 's/^  ROUTE \([a-z0-9_-]*\) *BLOCKED.*/\1/p' "$LOG" 2>/dev/null | paste -sd,)"; blk="${blk//,/, }"
+
+# 🔴 THE TITLE MUST NOT SAY "DOWN" WHEN NOTHING IS DOWN. Caught by running this by hand
+# 2026-09-07 while every route was PASS or BLOCKED: the old line fell back to "a route is DOWN"
+# because $bad was empty, and shouted about a machine that was working. An alert that
+# exaggerates is the same defect as one that under-reports -- both teach Chris to stop reading
+# it. In normal operation this file only runs as OnFailure=, which BLOCKED never triggers; this
+# is for the hand-run and for whatever the next failure mode turns out to be.
+if [ -n "$bad" ]; then
+  title="Ask Bar: ${bad} is DOWN"
+elif [ -n "$blk" ]; then
+  title="Ask Bar: ${blk} waiting on you (nothing is broken)"
+else
+  title="Ask Bar: verdict ${verdict:-MISSING}"
+fi
+body="verdict ${verdict:-MISSING}. ${summary:-no summary line — the checker did not finish}
+${blk:+Waiting on you (not broken): ${blk}
+}Detail: ~/.askbar/selftest.log
+Re-run: ask-selftest"
+
+echo "NOTIFY TITLE: $title"
+echo "NOTIFY BODY: $body"
+if command -v notify-send >/dev/null 2>&1; then
+  # -u critical so it does not auto-dismiss before he looks at it.
+  if notify-send -u critical -a "ask-selftest" "$title" "$body"; then
+    echo "NOTIFY SENT: yes"
+  else
+    echo "NOTIFY SENT: no — notify-send could not reach the session bus"
+    exit 1
+  fi
+else
+  echo "NOTIFY SENT: no — notify-send is not installed"
+  exit 1
+fi

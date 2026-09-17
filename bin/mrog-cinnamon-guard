@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# ~/mrog/mrog-cinnamon-guard -- catch the Cinnamon leak BEFORE it freezes you.
+#
+# WHY. FLEET-CB2 2026-09-05. Chris froze twice in one afternoon. Both times the
+# system was healthy by every ordinary measure -- load ~1.7 on 16 cores, 14 GiB
+# free, swap untouched, no kernel errors, X answering queries -- and both times
+# the screen had simply stopped repainting.
+#
+# MEASURED, with mrog-freeze-capture running DURING the second freeze:
+#     cinnamon  pid 2307  age 20.8h  RSS 1768 MB  cpu 90.9%  main loop blocked
+#     cinnamon  fresh                RSS  238 MB  idle
+# ~70 MB/hour. Around 20 hours it wedges. The two freezes were at 19.6h and
+# 20.8h uptime.
+#
+# WHAT MISLED ME, so nobody repeats it: the notch was at 100% CPU in the same
+# capture and looked like the culprit. It was a VICTIM -- a GTK overlay blocked
+# on a wedged compositor spins. Run the notch against a healthy Cinnamon and it
+# sits at 0.0%. Killing the notch did not thaw the desktop; killing Cinnamon
+# did. Correlation with the thing you changed most recently is not causation.
+#
+#   mrog-cinnamon-guard             one check, print a verdict
+#   mrog-cinnamon-guard --watch     loop, notify once per crossing
+#   mrog-cinnamon-guard --restart   replace the shell now, keeping your apps
+set -uo pipefail
+export DISPLAY="${DISPLAY:-:0}"
+
+WARN_MB="${MROG_CINNAMON_WARN_MB:-900}"     # ~13h in. Plenty of runway.
+DANGER_MB="${MROG_CINNAMON_DANGER_MB:-1400}" # ~20h. It wedged at 1768.
+INTERVAL="${MROG_CINNAMON_INTERVAL:-600}"
+STAMP="${XDG_RUNTIME_DIR:-/tmp}/mrog-cinnamon-guard.last"
+
+cinnamon_pid() { pgrep -f 'cinnamon --replace' | head -1 || pgrep -x cinnamon | head -1; }
+
+read_rss_mb() {
+    local p="$1" k
+    k=$(ps -o rss= -p "$p" 2>/dev/null | tr -d ' ')
+    [ -n "$k" ] && echo $(( k / 1024 )) || echo 0
+}
+
+check() {
+    local p rss age
+    p=$(cinnamon_pid)
+    [ -n "$p" ] || { echo "cinnamon: NOT RUNNING"; return 3; }
+    rss=$(read_rss_mb "$p")
+    age=$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ')
+    printf 'cinnamon pid %s  age %sh %sm  RSS %s MB  ' \
+        "$p" $((age/3600)) $(((age%3600)/60)) "$rss"
+    if   (( rss >= DANGER_MB )); then echo "DANGER (>= ${DANGER_MB})"; return 2
+    elif (( rss >= WARN_MB   )); then echo "WARN (>= ${WARN_MB})";     return 1
+    else                              echo "ok";                       return 0
+    fi
+}
+
+notify() {
+    command -v notify-send >/dev/null 2>&1 &&
+        notify-send -u "${2:-normal}" "Cinnamon memory" "$1" 2>/dev/null || true
+    echo "$1"
+}
+
+do_restart() {
+    # `cinnamon --replace` DOES NOT ALWAYS REPLACE. Measured today: the old
+    # process stayed alive, so two shells ran at once, neither owned the window
+    # list (wmctrl reported 0 windows) and the desktop stayed frozen. The old
+    # one then ignored SIGTERM and needed -9. So: start the new one, then make
+    # sure the old one is actually gone.
+    local old new
+    old=$(cinnamon_pid)
+    echo "replacing cinnamon (old pid ${old:-none})"
+    nohup cinnamon --replace >/tmp/cinnamon-replace.log 2>&1 &
+    sleep 12
+    if [ -n "$old" ] && ps -p "$old" >/dev/null 2>&1; then
+        echo "  old shell survived --replace; terminating it"
+        kill -TERM "$old" 2>/dev/null; sleep 5
+        ps -p "$old" >/dev/null 2>&1 && { echo "  TERM ignored, KILL"; kill -9 "$old" 2>/dev/null; }
+        sleep 4
+    fi
+    new=$(cinnamon_pid)
+    echo "  new pid ${new:-NONE}  RSS $(read_rss_mb "${new:-0}") MB"
+    # Prove it, do not assume: the shell is only back when D-Bus answers AND
+    # the window list is non-empty.
+    local wins
+    wins=$(wmctrl -l 2>/dev/null | wc -l)
+    if timeout 8 dbus-send --session --print-reply --dest=org.Cinnamon /org/Cinnamon \
+        org.freedesktop.DBus.Properties.Get string:org.Cinnamon string:OverviewActive \
+        >/dev/null 2>&1 && [ "$wins" -gt 0 ]; then
+        echo "  RECOVERED: D-Bus answering, $wins windows"
+        return 0
+    fi
+    echo "  NOT RECOVERED: D-Bus silent or 0 windows. Log: /tmp/cinnamon-replace.log"
+    return 1
+}
+
+case "${1:-}" in
+  --restart) do_restart ;;
+  --watch)
+    echo "watching cinnamon every ${INTERVAL}s (warn ${WARN_MB} MB, danger ${DANGER_MB} MB)"
+    while true; do
+      out=$(check); rc=$?
+      # Notify once per crossing, not every interval -- a nag every 10 minutes
+      # gets muted, and a muted warning is no warning.
+      last=$(cat "$STAMP" 2>/dev/null || echo 0)
+      if [ "$rc" != "$last" ]; then
+        case "$rc" in
+          1) notify "$out
+Restart the shell when convenient: mrog-cinnamon-guard --restart" normal ;;
+          2) notify "$out
+It wedged at 1768 MB today. Restart now: mrog-cinnamon-guard --restart" critical ;;
+        esac
+        echo "$rc" > "$STAMP"
+      fi
+      echo "$(date +%H:%M:%S)  $out"
+      sleep "$INTERVAL"
+    done ;;
+  *) check ;;
+esac

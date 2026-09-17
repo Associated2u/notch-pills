@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+# ~/bin/mrog-unfreeze -- unstick a frozen laptop desktop, from a phone.
+#
+#   ssh laptop '~/bin/mrog-unfreeze'              diagnose + break X grabs (SAFE)
+#   ssh laptop '~/bin/mrog-unfreeze --restart'    also restart Cinnamon (LOSES session state)
+#   ssh laptop '~/bin/mrog-unfreeze --status'     look only, change nothing
+#
+# WHY IT IS ORDERED THIS WAY. 2026-09-06 the desktop froze and the cause was
+# found by the parallel Hermes session:
+#
+#   flameshot (PID 84935) was stuck holding an X pointer+keyboard grab.
+#   A GRAB SURVIVES A COMPOSITOR RESTART.
+#
+# I reached for `cinnamon --replace` first, it did nothing (a wedged Cinnamon
+# cannot even process the replace handshake), and I then killed the 22-hour
+# Cinnamon that Hermes had explicitly flagged as the one to KEEP. That dropped
+# the desktop into fallback mode and destroyed 22 hours of panel/workspace state
+# -- while the actual cause was already fixed.
+#
+# So this script does the cheap, reversible, correct thing FIRST and refuses to
+# touch the compositor unless explicitly told to. Restarting Cinnamon is the
+# LAST resort, not the first reflex.
+#
+# It works while the GUI is dead because sshd and the shell keep running -- that
+# is the whole point of driving it from a phone.
+set -uo pipefail
+export DISPLAY="${DISPLAY:-:0}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+LOG_DIR="${MROG_ROOT:-$HOME/mrog}/audit/freezes"
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/unfreeze-$(date +%Y%m%dT%H%M%S).log"
+say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+
+MODE="${1:-}"
+
+# RSS ALONE decides. FIXED 2026-09-06 after this detector MISSED a live runaway.
+#
+# The first version required high CPU *and* high RSS, reading CPU from
+# `ps pcpu`. That is the LIFETIME AVERAGE, not the current rate -- the very trap
+# already written up in 90-traps.md. The runaway measured 94% in `top` and
+# 27.5% in `ps` (averaged over its 824s life), so the AND-condition failed and
+# the script reported "compositor CPU/RSS look normal" while Cinnamon sat at
+# 1.9 GB eating a core. It ran from Chris's phone, correctly did nothing, and
+# looked broken.
+#
+# RSS needs no sampling window and cannot be averaged into innocence. A healthy
+# Cinnamon on this machine is 136-250 MB; both runaways that day were 1.5 GB and
+# 2.4 GB. 700 MB is nowhere near normal and nowhere near the failures.
+# CPU is still REPORTED, because it is useful context -- it is just not the test.
+RUNAWAY_RSS_KB="${MROG_RUNAWAY_RSS_KB:-716800}"
+
+
+# ---- how to actually get Cinnamon back ------------------------------------
+# LEARNED THE HARD WAY 2026-09-06, after leaving Chris with NO desktop at all.
+#
+# When Cinnamon dies, the session starts **Metacity** as a fallback window
+# manager. Metacity then HOLDS the window-manager selection, so:
+#
+#   cinnamon --replace   -> BadAccess (attempt to access private resource denied)
+#                           request_code 2, i.e. "another WM owns this"
+#   cinnamon             -> same
+#
+# and both exit seconds after printing a SUCCESSFUL-looking startup log
+# ("AppletManager started", "Cinnamon took 535 ms to start"), which makes it
+# look like they worked. They did not.
+#
+# The order that works -- and every step of it is load-bearing, see D2:
+#   1. reap the stale cinnamon wreckage
+#   2. kill the stale cinnamon-launcher, BEFORE metacity
+#   3. kill the fallback WM (metacity) LAST, so nothing can respawn it
+#   4. start via `cinnamon-launcher`, NOT `cinnamon` and NOT `cinnamon --replace`
+#
+# Check who holds it with:
+#   xprop -root _NET_SUPPORTING_WM_CHECK   then   xprop -id <win> _NET_WM_NAME
+#   healthy Cinnamon reports "Mutter (Muffin)"; the fallback reports "Metacity".
+#
+# 🔴 REWRITTEN 2026-09-07 (HERMES-VGE) after all three of its defects were
+# MEASURED -- in a nested X server on :11, with the real desktop never involved.
+# Transcripts: ~/mrog/audit/unfreeze-VGE/D{1,2,3}-before.txt.
+#
+#   D1  Given a metacity fallback plus one `cinnamon --replace` orphan that
+#       manages no windows, the old code killed metacity, matched the orphan
+#       with `pgrep -x cinnamon`, printed "cinnamon already running" and
+#       RETURNED SUCCESS having started nothing:
+#           before: WM="Metacity"   after: WM=NONE, restart_shell returned 0
+#       It took a desktop that at least had a fallback WM and left one with NO
+#       window manager at all -- strictly worse than the state it found, while
+#       reporting that it had worked.
+#       🎯 "A process named cinnamon exists" IS NOT "a window manager is
+#       running". A wedged cinnamon, a `--replace` orphan and a <defunct>
+#       zombie all answer `pgrep -x cinnamon`. Ask the X server who owns the
+#       selection instead -- that is the thing Chris actually needs back.
+#
+#   D2  It never killed the stale `cinnamon-launcher`, and the launcher is what
+#       resurrects the fallback. /usr/bin/cinnamon-launcher:79-93 waitpid()s its
+#       cinnamon child, and on `if not os.WIFEXITED(exit_status)` -- the child
+#       died from a SIGNAL, which is exactly how this script kills it -- forks
+#       `metacity --replace` (FALLBACK_COMMAND/FALLBACK_ARGS, :20-21). That
+#       `--replace` then steals the selection back from the Cinnamon we just
+#       started. Measured on :0 2026-09-07: Muffin at T+13s, Metacity again by
+#       T+35s. Measured in the fixture, D2-before.txt:
+#           restart_shell: "WM is now: Mutter (Muffin)", returned 0
+#           T+5s through T+45s: WM="Metacity"      <- the stale launcher won
+#       🎯 Kill the launcher BEFORE metacity, and metacity LAST. Order is not
+#       taste here; it is the difference between a repair and a 30-second lie.
+#
+#   D3  NEVER `pkill -f`. Two independent reasons, both measured 2026-09-07,
+#       either one on its own fatal (D3-before.txt, D3-collateral.txt):
+#         a. the HEALTHY compositor on this machine has the command line
+#            `cinnamon --replace` -- cinnamon-launcher:63 execs it that way. So
+#            `pkill -f "cinnamon --replace"` kills the LIVE DESKTOP, not an
+#            orphan. Read-only proof on :0: `pgrep -af "cinnamon --replace"`
+#            returned pid 503215, Chris's running Cinnamon, parent 503214.
+#         b. the pattern sits inside the command line of the shell that types
+#            it, so it kills its own ssh session. That same pgrep also returned
+#            pid 582863 -- the shell doing the asking. Executed in the sandbox,
+#            the recovery shell died with status 143 (128+SIGTERM, its own) and
+#            never reached the line after its own pkill. THIS SCRIPT IS DRIVEN
+#            FROM A PHONE: that is the operator losing the connection
+#            mid-repair, with the desktop in pieces.
+#       🎯 Match /proc/<pid>/comm and kill explicit PIDs. Nothing this script
+#       runs is ever *named* cinnamon or metacity, so comm cannot self-match.
+
+# comm-matched PID lookup -- the D3-safe replacement for pgrep/pkill patterns.
+# $1 is the process name as the KERNEL stores it, and the kernel truncates comm
+# to 15 characters: `pgrep -x cinnamon-launcher` matches NOTHING (pgrep even
+# prints a warning saying so) while `cinnamon-launch` matches. MEASURED against
+# the live launcher, pid 503214, 2026-09-07. That truncation is where the stale
+# launcher hid through every previous version of this script, so match the full
+# name OR its 15-char prefix.
+# Zombies are skipped on purpose: a <defunct> process is not running and cannot
+# be killed, and counting one as "already running" is D1 exactly.
+pids_named() {
+    ps -eo pid=,stat=,comm= 2>/dev/null \
+      | awk -v w="$1" -v s="${1:0:15}" -v me="$$" \
+            '($3==w || $3==s) && $2 !~ /^Z/ && $1 != me {print $1}'
+}
+
+# TERM, then KILL whatever ignored it. Explicit PIDs only, never a pattern.
+reap_named() {
+    local what="$1" pids left p
+    pids=$(pids_named "$what")
+    if [ -z "$pids" ]; then say "  no live $what to reap"; return 0; fi
+    say "  reaping $what: $(echo $pids | tr '\n' ' ')(TERM)"
+    for p in $pids; do kill -TERM "$p" 2>/dev/null; done
+    sleep 3
+    left=""
+    for p in $pids; do kill -0 "$p" 2>/dev/null && left="$left $p"; done
+    if [ -n "$left" ]; then
+        say "  $what ignored TERM ($left ) -- KILL"
+        for p in $left; do kill -KILL "$p" 2>/dev/null; done
+        sleep 2
+    fi
+    return 0
+}
+
+# WHO OWNS THE WINDOW-MANAGER SELECTION -- the only honest "is the desktop back"
+# test, see D1. Prints "Mutter (Muffin)" for a healthy Cinnamon, "Metacity" for
+# the fallback, NONE when nothing owns it. A stale check window that no longer
+# answers also prints NONE, deliberately: unanswerable is not running.
+wm_owner() {
+    local w n
+    w=$(timeout 4 xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -o '0x[0-9a-f]*' | head -1)
+    [ -z "$w" ] && { printf 'NONE\n'; return 1; }
+    n=$(timeout 4 xprop -id "$w" _NET_WM_NAME 2>/dev/null | sed 's/.*= *//; s/^"//; s/"$//')
+    [ -z "$n" ] && { printf 'NONE\n'; return 1; }
+    printf '%s\n' "$n"
+    return 0
+}
+
+# DOES THE X SERVER ANSWER AT ALL? Not the same question as $X_OK above, which
+# comes from `xdotool getactivewindow` and therefore reports "X DID NOT ANSWER"
+# whenever no window happens to have focus -- measured doing exactly that in the
+# :11 fixture 2026-09-07 while xprop answered instantly. Root properties need no
+# focused window and no window manager, so this probe stays true in the state we
+# are actually recovering from. Judged on OUTPUT, not exit status.
+x_answers() { [ -n "$(timeout 4 xprop -root 2>/dev/null)" ]; }
+
+restart_shell() {
+    local z wm wm2 i
+    z=$(ps -eo stat=,comm= 2>/dev/null | awk '$2=="cinnamon" && $1 ~ /^Z/' | wc -l | tr -d ' ')
+    [ "$z" != "0" ] && say "  $z <defunct> cinnamon zombie(s): not running, not killable, ignored"
+    # 1. the wreckage. By the time we are here the caller has decided the shell
+    #    is being restarted, so every surviving cinnamon is wreckage.
+    reap_named cinnamon
+    # 2. the launcher SECOND and before metacity -- cinnamon-launcher:79-93.
+    reap_named cinnamon-launcher
+    # 3. metacity LAST. Now nothing alive can fork it again.
+    reap_named metacity
+    say "  starting via cinnamon-launcher (the only path that sticks)"
+    setsid nohup cinnamon-launcher >/tmp/mrog-cinnamon-launcher.log 2>&1 &
+    # 4. wait for a WM to OWN THE SELECTION, not for a pgrep match to appear --
+    #    and not for Metacity, which is the fallback we are here to escape.
+    for i in $(seq 1 12); do
+        sleep 3
+        wm=$(wm_owner) || continue
+        case "$wm" in Metacity*) continue ;; esac
+        break
+    done
+    wm=$(wm_owner)
+    # LOOK TWICE. D2 measured the old code printing "WM is now: Mutter (Muffin)"
+    # and returning 0 five seconds before metacity took the desktop back. One
+    # sample at the instant of maximum optimism is not a verdict.
+    sleep 6
+    wm2=$(wm_owner)
+    [ "$wm2" != "$wm" ] && say "  !! the WM changed under us within 6s: $wm -> $wm2"
+    say "  WM is now: $wm2"
+    say "  cinnamon pids: $(pids_named cinnamon | tr '\n' ' ')"
+    # 5. THE VERDICT. "Some window manager answered" is not the same claim as
+    #    "your desktop is back", and conflating them is how the old code
+    #    returned 0 with no WM at all. Two ways to fail, both reported as
+    #    failure, because Chris is reading this on a phone:
+    #      NONE     -> nothing owns the selection
+    #      Metacity -> FALLBACK MODE. The thing the user is trying to escape.
+    #    🔴 Found 2026-09-07 by the look-twice fixture itself: the first cut of
+    #    this rewrite said "WM is now: Metacity" and returned 0 -- a green
+    #    verdict over a fallback desktop. The test that was written to prove the
+    #    re-check works is what caught it. Evidence: D2class-detector.txt.
+    case "$wm2" in
+        NONE)
+            say "  !! NO window manager owns the selection -- the desktop is NOT back."
+            say "     log: /tmp/mrog-cinnamon-launcher.log"
+            return 1 ;;
+        Metacity*)
+            say "  !! the WM is METACITY -- that is FALLBACK MODE, not your desktop."
+            say "     Something is putting it back after we removed it. Surviving"
+            say "     cinnamon-launcher pids: [$(pids_named cinnamon-launcher | tr '\n' ' ')]"
+            say "     log: /tmp/mrog-cinnamon-launcher.log"
+            return 1 ;;
+    esac
+    return 0
+}
+
+say "=== mrog-unfreeze $(date -Is) mode=${MODE:-safe} ==="
+say ""
+
+# ---- 1. WHAT IS ACTUALLY WRONG -------------------------------------------
+say "--- is X alive? (it usually is; that is why this looks worse than it is) ---"
+if timeout 4 xdotool getactivewindow getwindowname >/dev/null 2>&1; then
+    say "  X ANSWERS: $(timeout 4 xdotool getactivewindow getwindowname 2>/dev/null)"
+    X_OK=1
+else
+    say "  X DID NOT ANSWER in 4s -- server-level stall, grabs are not the issue"
+    X_OK=0
+fi
+
+say ""
+say "--- compositor ---"
+ps -eo pid,etimes,rss,pcpu,comm --sort=-rss 2>/dev/null \
+  | awk 'NR==1 || /cinnamon|Xorg|muffin/ {printf "  %s\n", $0}' | head -6 | tee -a "$LOG"
+
+say ""
+say "--- KNOWN GRAB HOLDERS running (this is the usual culprit) ---"
+# flameshot's region-select takes a pointer+keyboard grab. If it launches with
+# no display to draw on, it sits there holding the whole desktop hostage.
+GRABBERS=""
+for pat in flameshot spectacle shutter gnome-screenshot xfce4-screenshooter \
+           scrot maim slop key-mon xdotool; do
+    for p in $(pgrep -x "$pat" 2>/dev/null); do
+        say "  $pat pid=$p  up $(ps -o etimes= -p "$p" | tr -d ' ')s"
+        GRABBERS="$GRABBERS $p"
+    done
+done
+[ -z "$GRABBERS" ] && say "  none running"
+
+[ "$MODE" = "--status" ] && { say ""; say "status only -- nothing changed. log: $LOG"; exit 0; }
+
+# ---- 2. BREAK THE GRAB (cheap, reversible, usually the whole fix) ---------
+say ""
+say "--- breaking any X grab ---"
+# XF86Ungrab is the X server's own escape hatch for exactly this.
+timeout 4 xdotool key XF86Ungrab 2>/dev/null && say "  sent XF86Ungrab" \
+                                              || say "  XF86Ungrab not accepted"
+if [ -n "$GRABBERS" ]; then
+    for p in $GRABBERS; do
+        kill -TERM "$p" 2>/dev/null && say "  TERM -> pid $p"
+    done
+    sleep 2
+    for p in $GRABBERS; do
+        kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null && say "  KILL -> pid $p"
+    done
+fi
+
+sleep 2
+
+# ---- 2b. RUNAWAY COMPOSITOR ----------------------------------------------
+# A different freeze from the grab, and the one that beat this script on
+# 2026-09-06: Cinnamon at 1.5 GB / 83% CPU with NO grab holder running. The
+# pointer answered, windows were alive, nothing painted. Ungrab is irrelevant
+# to it, so the script reported success and the laptop stayed frozen.
+#
+# Age is the WRONG signal for which one to kill -- in the first freeze that day
+# the oldest cinnamon held 22 hours of session state and killing it destroyed
+# exactly that. Pick the one MISBEHAVING: high CPU and large RSS.
+say ""
+say "--- runaway compositor? (rss >=$((RUNAWAY_RSS_KB/1024))MB) ---"
+RUNAWAY=""
+while read -r rpid rcpu rrss; do
+    [ -z "$rpid" ] && continue
+    if [ "$rrss" -ge "$RUNAWAY_RSS_KB" ] 2>/dev/null; then
+        # cpu here is ps's LIFETIME AVERAGE -- shown for context only. Testing
+        # on it is what made this detector miss a 1.9 GB runaway.
+        say "  RUNAWAY: pid $rpid rss=$((rrss/1024))MB (lifetime-avg cpu ${rcpu}%)"
+        RUNAWAY="$RUNAWAY $rpid"
+    fi
+done < <(ps -eo pid,pcpu,rss,comm --no-headers 2>/dev/null | awk '$4=="cinnamon"{print $1, $2, $3}')
+
+if [ -n "$RUNAWAY" ]; then
+    HEALTHY=$(ps -eo pid,pcpu,rss,comm --no-headers 2>/dev/null \
+              | awk -v bad="$RUNAWAY" '$4=="cinnamon"{s=" "$1" "; if (index(" "bad" ", s)==0) print $1}' | head -1)
+    if [ -n "$HEALTHY" ]; then
+        say "  a healthy cinnamon exists (pid $HEALTHY) -- killing only the runaway"
+    else
+        say "  no healthy sibling; the desktop shell will respawn after the kill"
+    fi
+    for p in $RUNAWAY; do
+        kill -TERM "$p" 2>/dev/null && say "  TERM -> $p"
+    done
+    sleep 5
+    for p in $RUNAWAY; do
+        # MEASURED: the 1.5 GB runaway ignored TERM entirely and needed KILL.
+        kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null && say "  KILL -> $p"
+    done
+    sleep 4
+    # WAS, until 2026-09-07 (HERMES-VGE):
+    #     pgrep -x cinnamon >/dev/null || { setsid nohup cinnamon --replace & }
+    # Both halves were wrong. The test counted the <defunct> zombie of a process
+    # we had SIGKILLed four seconds earlier as a running desktop (D1), and the
+    # remedy was the `cinnamon --replace` path this script's own header, 100
+    # lines up, documents as BadAccess-then-exit. Ask the X server, then use the
+    # one recovery path that has ever worked.
+    # LIVENESS GUARD: if X itself is not answering, wm_owner printing NONE says
+    # nothing about the window manager -- it is a timeout, not a verdict -- and
+    # reaping the compositor on the strength of one is how this script last made
+    # things worse. A server-level stall is not ours to fix here.
+    # This uses x_answers, NOT $X_OK. $X_OK is false whenever nothing has focus,
+    # which is common on a broken desktop and has nothing to do with X being up.
+    if x_answers && { [ -z "$(pids_named cinnamon)" ] || [ "$(wm_owner)" = "NONE" ]; }; then
+        say "  nothing live is running the shell (WM=$(wm_owner)) -- bringing it back"
+        restart_shell
+    fi
+    say "  cinnamon now: $(ps -eo pid,rss,pcpu,comm --no-headers | awk '$4=="cinnamon"{printf "%s(%dMB %s%%) ", $1, $2/1024, $3}')"
+else
+    say "  none -- compositor CPU/RSS look normal"
+fi
+
+say ""
+say "--- did that fix it? ---"
+if timeout 4 xdotool getmouselocation >/dev/null 2>&1; then
+    say "  POINTER RESPONDS -- input should be free. Try the mouse now."
+    FIXED=1
+else
+    say "  pointer still not responding"
+    FIXED=0
+fi
+
+# ---- 3. LAST RESORT, and only when asked ---------------------------------
+if [ "$MODE" != "--restart" ]; then
+    say ""
+    if [ "$FIXED" = 1 ]; then
+        say "Done. If the desktop is usable, STOP HERE."
+    else
+        say "Still stuck. If you want the compositor restarted, re-run with:"
+        say "    ssh laptop '~/bin/mrog-unfreeze --restart'"
+    fi
+    say ""
+    say "NOT restarting Cinnamon. That LOSES panel/workspace session state, it does"
+    say "NOT clear an X grab, and on 2026-09-06 doing it first destroyed 22 hours of"
+    say "state while the real cause (a flameshot grab) was already fixed."
+    say "log: $LOG"
+    exit 0
+fi
+
+say ""
+say "--- --restart given: restarting the compositor ---"
+# Report what is about to go. The OLDEST cinnamon is the session's real one; a
+# short-lived sibling is usually a failed --replace attempt, and killing the
+# wrong one is the mistake this script exists to prevent. In --restart mode
+# Chris has explicitly asked for the compositor to go, so restart_shell reaps
+# all of them -- but the log still says which was which.
+MAIN=$(ps -eo pid=,etimes=,comm= --sort=-etimes 2>/dev/null | awk '$3=="cinnamon"{print $1; exit}')
+if [ -n "$MAIN" ]; then
+    say "  oldest cinnamon = $MAIN (up $(ps -o etimes= -p "$MAIN" 2>/dev/null | tr -d ' ')s, rss $(ps -o rss= -p "$MAIN" 2>/dev/null | tr -d ' ')KB)"
+else
+    say "  no cinnamon process at all -- the shell is already gone"
+fi
+OTHERS=$(pids_named cinnamon | grep -v "^${MAIN:-none}$" | tr '\n' ' ')
+[ -n "$OTHERS" ] && say "  other cinnamon pids present: $OTHERS"
+say "  WM before: $(wm_owner)"
+
+# 🗑️ THE "POLITE PATH" WAS DELETED 2026-09-07 (HERMES-VGE). It was:
+#       say "  trying the polite path first"
+#       setsid nohup cinnamon --replace >/tmp/mrog-unfreeze-cinnamon.log 2>&1 &
+#       sleep 12
+#       NEW=<youngest cinnamon>
+#       [ -n "$NEW" ] && [ "$NEW" != "$MAIN" ] && say "RESTARTED cleanly: ..."
+#   Three measured problems, any one of which ends with a dead desktop and a log
+#   that says it worked:
+#     - this script's OWN header documents `cinnamon --replace` as
+#       BadAccess-then-exit whenever another WM owns the selection -- i.e.
+#       exactly the fallback-mode state this branch runs in. The script was
+#       arguing with itself, and the header was the half that was right.
+#     - the success test was "some cinnamon pid that is not MAIN". The doomed
+#       --replace attempt IS such a pid: for the few seconds it lives, and then
+#       as this script's own <defunct> child. "RESTARTED cleanly" gets printed
+#       for a process that has already died. That is D1's failure mode sitting
+#       in the branch that pronounces the verdict.
+#     - and it left MAIN, the stale launcher and metacity all alive, which is
+#       D2 waiting to happen.
+#   There is no polite path. There is one path that works.
+restart_shell
+say "  now: $(pids_named cinnamon | tr '\n' ' ')"
+
+say ""
+say "--- final ---"
+say "  window manager: $(wm_owner)   <- NONE means the desktop is NOT back"
+say "  cinnamon: $(pids_named cinnamon | tr '\n' ' ')"
+say "  windows alive: $(timeout 5 xdotool search --name '.' 2>/dev/null | wc -l)"
+say "  If a 'Cinnamon just crashed / fallback mode' dialog appears, answer YES."
+say "log: $LOG"

@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# ~/mrog/bin/mrog-shell-guard -- contain a latched desktop-shell runaway.
+#
+# STATED FAILURE CLASS (this is what it is built to catch, and the only thing
+# it claims to catch):
+#
+#   The desktop shell process (cinnamon, or metacity in fallback) is burning
+#   >= CPU_LIMIT% of a core ON ITS MAIN THREAD while its GLib main loop is no
+#   longer dispatching -- a LATCHED compositor spin. The X server stays alive
+#   and the pointer still moves, but window management, the panel and alt-tab
+#   are dead. That is what Chris experiences as "frozen".
+#
+# WHY EVERY EXISTING GUARD MISSES IT (all measured 2026-09-07, HERMES-VGE):
+#
+#   * cinnamon-launcher's memory limit tests (rss - shared) every 300 s against
+#     2048 MB. Live cinnamon: rss=265.9 MB shared=145.5 MB -> it sees 120.4 MB,
+#     so it only fires near 2.2 GB RSS.
+#   * mrog-unfreeze's runaway detector is RSS >= 700 MB.
+#   * THE MEASURED LATCH RAN 31.5 MINUTES AT 99-100% CPU WITH RSS PINNED FLAT
+#     AT 552 MB. Both tests are structurally blind to it: it has no memory
+#     growth at all. That is the gap this guard exists to close.
+#
+# WHY IT DOES NOT USE A CPU QUOTA. nproc=16, so a one-core spin is 6.25% of the
+# machine and Xorg sat at 2-6% throughout the latch. The desktop is not CPU
+# starved -- the main loop is not servicing. A CPUQuota would not prevent the
+# freeze and would only slow the drain and the recovery.
+#
+# WHY THE LIVENESS PROBE IS NOT Peer.Ping. MEASURED against a fixture that
+# busy-spins on its own main loop (vgec-loopfix.py):
+#     HEALTHY  ping OK 0.00s | method OK 0.00s | prop OK 0.00s
+#     WEDGED   ping OK 0.00s | method TIMEOUT 4.01s | prop TIMEOUT 4.01s
+# GDBus answers org.freedesktop.DBus.Peer.Ping on its internal worker thread, so
+# a guard built on Ping reports a frozen desktop as healthy FOREVER. Only a real
+# exported method or property reaches the main loop. This guard uses
+# Properties.Get org.Cinnamon CinnamonVersion -- read-only, no side effects,
+# 3-5 ms on a healthy cinnamon.
+#
+# FAIL-SAFE RULES, in order of importance:
+#   1. It never acts on a measurement it could not take (CANNOT-MEASURE).
+#   2. It never acts while the main loop still answers (BUSY) -- a compositor
+#      that is merely working hard is not a frozen one.
+#   3. It never acts more than MAX_ACTIONS times per RATE_WINDOW (SUPPRESSED).
+#      Killing cinnamon drops the desktop into Metacity, so an unbounded
+#      restart loop is WORSE than the freeze it is treating.
+#   4. Every verdict is a printed WORD, never an exit status.
+set -uo pipefail
+
+CPU_LIMIT="${MROG_SHELL_CPU_LIMIT:-80}"
+STRIKES_MAX="${MROG_SHELL_STRIKES:-4}"
+WINDOW="${MROG_SHELL_WINDOW:-3}"
+PROBE_MS="${MROG_SHELL_PROBE_TIMEOUT:-3000}"
+ACTION="${MROG_SHELL_ACTION:-restart}"
+ACTION_CMD="${MROG_SHELL_ACTION_CMD:-$HOME/bin/mrog-unfreeze --restart}"
+MAX_ACTIONS="${MROG_SHELL_MAX_ACTIONS:-2}"
+RATE_WINDOW="${MROG_SHELL_RATE_WINDOW:-3600}"
+CYCLES="${MROG_SHELL_CYCLES:-0}"          # 0 = forever; >0 = run N cycles (tests)
+TARGET_PID="${MROG_SHELL_TARGET_PID:-}"
+TARGET_PIDFILE="${MROG_SHELL_TARGET_PIDFILE:-}"   # test seam only: re-read the target pid each cycle
+PROBE_DEST="${MROG_SHELL_DBUS_DEST:-}"
+PROBE_PATH="${MROG_SHELL_DBUS_PATH:-}"
+PROBE_IFACE="${MROG_SHELL_DBUS_IFACE:-}"
+PROBE_PROP="${MROG_SHELL_DBUS_PROP:-}"
+
+export DISPLAY="${DISPLAY:-:0}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+STATE_DIR="${MROG_SHELL_STATE_DIR:-$HOME/.cache/mrog-shell-guard}"
+LOG_DIR="${MROG_SHELL_LOG_DIR:-$HOME/mrog/audit/freezes}"
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+ACTIONS_LOG="$STATE_DIR/actions.log"
+: > /dev/null
+
+log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*"; }
+HZ=$(getconf CLK_TCK)
+
+# ---- measurement -----------------------------------------------------------
+# INSTANTANEOUS cpu from /proc/<pid>/stat fields 14+15. NEVER `ps pcpu`, which
+# is a LIFETIME AVERAGE -- the trap that made an earlier detector miss a live
+# runaway measuring 94% in top and 27.5% in ps.
+jiff()      { awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null; }
+jiff_main() { awk '{print $14+$15}' "/proc/$1/task/$1/stat" 2>/dev/null; }
+rss_kb()    { awk '/^VmRSS:/{print $2}' "/proc/$1/status" 2>/dev/null; }
+
+# find the shell: explicit override, else oldest cinnamon, else metacity
+find_shell() {
+    if [ -n "$TARGET_PIDFILE" ]; then
+        local fp; fp=$(cat "$TARGET_PIDFILE" 2>/dev/null | tr -dc '0-9')
+        [ -n "$fp" ] && [ -d "/proc/$fp" ] && { echo "$fp fixture"; return 0; }
+        return 2
+    fi
+    if [ -n "$TARGET_PID" ]; then
+        [ -d "/proc/$TARGET_PID" ] && { echo "$TARGET_PID fixture"; return 0; }
+        return 2
+    fi
+    local p
+    p=$(ps -eo pid,etimes,comm --no-headers 2>/dev/null \
+        | awk '$3=="cinnamon"{print $2, $1}' | sort -rn | head -1 | awk '{print $2}')
+    [ -n "$p" ] && { echo "$p cinnamon"; return 0; }
+    p=$(ps -eo pid,etimes,comm --no-headers 2>/dev/null \
+        | awk '$3=="metacity"{print $2, $1}' | sort -rn | head -1 | awk '{print $2}')
+    [ -n "$p" ] && { echo "$p metacity"; return 0; }
+    return 1
+}
+
+# main-loop liveness. Prints the WORD ALIVE / DEAD / NOPROBE.
+loop_probe() {
+    local kind="$1" dest path iface prop out
+    case "$kind" in
+        cinnamon) dest=org.Cinnamon; path=/org/Cinnamon; iface=org.Cinnamon; prop=CinnamonVersion ;;
+        fixture)  dest="$PROBE_DEST"; path="$PROBE_PATH"; iface="$PROBE_IFACE"; prop="$PROBE_PROP" ;;
+        *)        echo NOPROBE; return 0 ;;
+    esac
+    [ -z "$dest" ] && { echo NOPROBE; return 0; }
+    out=$(timeout "$(( PROBE_MS / 1000 + 3 ))" dbus-send --session --print-reply \
+            --reply-timeout="$PROBE_MS" --dest="$dest" "$path" \
+            org.freedesktop.DBus.Properties.Get "string:$iface" "string:$prop" 2>&1)
+    case "$out" in
+        *variant*) echo ALIVE ;;
+        *)         echo DEAD  ;;
+    esac
+}
+
+# ---- rate limiting ---------------------------------------------------------
+actions_in_window() {
+    local now cutoff n=0 t
+    now=$(date +%s); cutoff=$(( now - RATE_WINDOW ))
+    [ -f "$ACTIONS_LOG" ] || { echo 0; return; }
+    while read -r t _; do
+        case "$t" in ''|*[!0-9]*) continue ;; esac
+        [ "$t" -ge "$cutoff" ] && n=$(( n + 1 ))
+    done < "$ACTIONS_LOG"
+    echo "$n"
+}
+
+capture() {   # $1=pid $2=name -> diagnostics file, no ptrace needed
+    local pid="$1" name="$2" f
+    f="$LOG_DIR/shellguard-$(date +%Y%m%dT%H%M%S).txt"
+    {
+        echo "=== mrog-shell-guard WEDGED capture $(date -Is) ==="
+        echo "target: pid=$pid name=$name  cpu_limit=${CPU_LIMIT}% strikes=${STRIKES_MAX}x${WINDOW}s"
+        echo
+        echo "--- per-thread CPU jiffies over ${WINDOW}s (main thread == pid) ---"
+        echo "    NOTE: gdb/perf are unavailable here (ptrace_scope=1,"
+        echo "    perf_event_paranoid=4, no passwordless sudo), so per-thread"
+        echo "    jiffies are the best available discriminator: if the pid's own"
+        echo "    row carries the delta, the spin is on the MAIN LOOP."
+        local -a t0=() ; local tid
+        for tid in /proc/"$pid"/task/*; do
+            t0+=("$(basename "$tid"):$(awk '{print $14+$15}' "$tid/stat" 2>/dev/null)")
+        done
+        sleep "$WINDOW"
+        local e
+        for e in "${t0[@]}"; do
+            tid="${e%%:*}"; local a="${e##*:}"
+            local b; b=$(awk '{print $14+$15}' "/proc/$pid/task/$tid/stat" 2>/dev/null)
+            [ -z "$b" ] && continue
+            printf '  tid=%-8s %-18s delta=%-6s %s\n' "$tid" \
+                "$(cat "/proc/$pid/task/$tid/comm" 2>/dev/null)" "$((b-a))" \
+                "$( [ "$tid" = "$pid" ] && echo '<-- MAIN')"
+        done
+        echo
+        echo "--- memory (Private_Dirty is the process's OWN heap; a big Rss on an"
+        echo "    X client can be the SERVER's pixmaps, so read this, not Rss) ---"
+        grep -E '^(Rss|Pss|Shared_Clean|Private_Dirty|Anonymous)' \
+            "/proc/$pid/smaps_rollup" 2>/dev/null | sed 's/^/  /'
+        echo
+        echo "--- top (LAST sample only; the first is a lifetime average) ---"
+        top -b -n 2 -d 1.5 -o %CPU 2>/dev/null | awk '/^ *PID/{s++} s==2' | head -12 | sed 's/^/  /'
+        echo
+        echo "--- tail of ~/.xsession-errors ---"
+        tail -25 "$HOME/.xsession-errors" 2>/dev/null | sed 's/^/  /'
+    } > "$f" 2>&1
+    echo "$f"
+}
+
+log "=== mrog-shell-guard up: limit=${CPU_LIMIT}% strikes=${STRIKES_MAX}x${WINDOW}s action=${ACTION} rate=${MAX_ACTIONS}/${RATE_WINDOW}s ==="
+
+strikes=0
+cyc=0
+while :; do
+    cyc=$(( cyc + 1 ))
+    [ "$CYCLES" -gt 0 ] && [ "$cyc" -gt "$CYCLES" ] && { log "cycles exhausted"; exit 0; }
+
+    if ! read -r PID NAME < <(find_shell); then
+        if [ -n "$TARGET_PID$TARGET_PIDFILE" ]; then
+            log "CANNOT-MEASURE explicit target is gone -- taking no action"
+        else
+            log "CANNOT-MEASURE no cinnamon and no metacity running -- taking no action"
+        fi
+        strikes=0; sleep "$WINDOW"; continue
+    fi
+
+    a=$(jiff "$PID"); am=$(jiff_main "$PID")
+    if [ -z "$a" ]; then
+        log "CANNOT-MEASURE pid $PID unreadable -- taking no action"; strikes=0; sleep "$WINDOW"; continue
+    fi
+    sleep "$WINDOW"
+    b=$(jiff "$PID"); bm=$(jiff_main "$PID")
+    if [ -z "$b" ]; then
+        log "CANNOT-MEASURE pid $PID vanished mid-sample -- taking no action"; strikes=0; continue
+    fi
+    cpu=$(awk -v a="$a" -v b="$b" -v h="$HZ" -v w="$WINDOW" 'BEGIN{printf "%.1f",(b-a)/h/w*100}')
+    cpum=$(awk -v a="$am" -v b="$bm" -v h="$HZ" -v w="$WINDOW" 'BEGIN{printf "%.1f",(b-a)/h/w*100}')
+    rk=$(rss_kb "$PID")
+
+    over=$(awk -v c="$cpu" -v l="$CPU_LIMIT" 'BEGIN{print (c>=l)?1:0}')
+    if [ "$over" != "1" ]; then
+        [ "$strikes" -gt 0 ] && log "cpu back to ${cpu}% -- strikes cleared"
+        strikes=0
+        log "HEALTHY $NAME pid=$PID cpu=${cpu}% main=${cpum}% rss=$((rk/1024))MB"
+        continue
+    fi
+
+    live=$(loop_probe "$NAME")
+    if [ "$live" = "ALIVE" ]; then
+        strikes=0
+        log "BUSY $NAME pid=$PID cpu=${cpu}% main=${cpum}% -- main loop ANSWERS, not a freeze, no action"
+        continue
+    fi
+
+    strikes=$(( strikes + 1 ))
+    if [ "$live" = "NOPROBE" ]; then
+        log "STRIKE ${strikes}/${STRIKES_MAX} $NAME pid=$PID cpu=${cpu}% main=${cpum}% (cpu-only: $NAME exports no DBus)"
+    else
+        log "STRIKE ${strikes}/${STRIKES_MAX} $NAME pid=$PID cpu=${cpu}% main=${cpum}% main-loop=DEAD"
+    fi
+    [ "$strikes" -lt "$STRIKES_MAX" ] && continue
+
+    log "WEDGED $NAME pid=$PID cpu=${cpu}% main=${cpum}% rss=$((rk/1024))MB"
+    cf=$(capture "$PID" "$NAME"); log "  capture: $cf"
+
+    n=$(actions_in_window)
+    if [ "$n" -ge "$MAX_ACTIONS" ]; then
+        log "SUPPRESSED $n recovery(ies) already in the last ${RATE_WINDOW}s (max ${MAX_ACTIONS}) -- NOT acting."
+        log "  Repeated restarts drop the desktop into Metacity and make things worse."
+        notify-send -u critical "mrog: shell wedged" \
+            "$NAME pid=$PID at ${cpu}%, main loop dead. Recovery SUPPRESSED (rate limit). See $cf" 2>/dev/null
+        strikes=0; continue
+    fi
+
+    if [ "$ACTION" != "restart" ]; then
+        log "REPORT-ONLY action=$ACTION -- not recovering. Would have run: $ACTION_CMD"
+        strikes=0; continue
+    fi
+
+    echo "$(date +%s) $NAME pid=$PID cpu=${cpu}" >> "$ACTIONS_LOG"
+    log "  running proven recovery: $ACTION_CMD"
+    $ACTION_CMD >>"$LOG_DIR/shellguard-actions.log" 2>&1
+    sleep 5
+    if read -r NPID NNAME < <(find_shell); then
+        nlive=$(loop_probe "$NNAME")
+        if [ "$nlive" = "ALIVE" ] || [ "$nlive" = "NOPROBE" ]; then
+            log "RECOVERED $NNAME pid=$NPID main-loop=$nlive"
+        else
+            log "RECOVERY-FAILED $NNAME pid=$NPID main loop still not answering"
+            notify-send -u critical "mrog: recovery FAILED" "see $cf" 2>/dev/null
+        fi
+    else
+        log "RECOVERY-FAILED no shell process at all after recovery"
+        notify-send -u critical "mrog: recovery FAILED" "no shell process" 2>/dev/null
+    fi
+    strikes=0
+done

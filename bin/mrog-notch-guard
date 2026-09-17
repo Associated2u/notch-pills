@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# mrog-notch-guard -- supervise mrog-notch, CATCH a runaway, and never let it
+# freeze the desktop again.
+#
+# WHY THIS EXISTS. 2026-09-06 18:52 -> 2026-09-07 06:52 the notch consumed
+# 11h48m30s of CPU in 12h01m of wall clock -- a permanent spin on the GTK MAIN
+# thread (measured per-TID, all worker threads at 0.0%). Cinnamon went to
+# 63-90% behind it, its RSS stepped +100 MB in one 2-minute sample, Xorg hit
+# 54%, and the desktop froze. Three freezes on 09-05 carry the same signature
+# in ~/mrog/audit/freezes/.
+#
+# 🔴 THE ROOT CAUSE IS NOT YET IDENTIFIED, AND THIS GUARD DOES NOT NEED IT.
+# Four hypotheses were tested on 2026-09-07 and ALL FOUR WERE FALSIFIED BY
+# MEASUREMENT, not by argument:
+#   1. stuck Button1Mask -> 25 ms drag tick        measured 0.7% -> 1.3%. No.
+#   2. the drag/sliver/_cancel_fade path            measured 2.0% ceiling.  No.
+#   3. askpill size-allocate -> Gtk.Fixed.move      fixture: 1 call in 3s.  No.
+#   4. the two `while True:` daemon threads         both sleep every path.  No.
+# So this is deliberately CAUSE-AGNOSTIC. It stops the freeze without knowing
+# why, and it captures the stack so the next occurrence is diagnosed in seconds
+# instead of a day of reading code.
+#
+# 🔴 PY-SPY MUST BE THE NOTCH'S PARENT. kernel.yama.ptrace_scope is 1 here, so
+# a tracer may only attach to its own DESCENDANT. `py-spy dump --pid` was
+# refused twice on 2026-09-07 -- once attaching to a stranger, and again from
+# inside this guard where py-spy was a SIBLING of the notch, not an ancestor.
+# Running the notch under `py-spy record` is what makes a stack possible at
+# all without root. py-spy writes its file on exit, so a capture INTERRUPTS the
+# recorder first and then reads the file.
+#
+# CPU IS SAMPLED INSTANTANEOUSLY, NEVER FROM `ps pcpu`. ps reports the LIFETIME
+# AVERAGE: mrog-unfreeze's own header records that this is exactly how it
+# missed a live 1.9 GB runaway. /proc/<pid>/stat deltas over a real interval
+# cannot be averaged into innocence.
+#
+# VERDICTS ARE PRINTED WORDS. Never test this script's exit code -- same rule
+# the fleet learned six times over, most recently freeze_table.sh --check.
+set -uo pipefail
+
+NOTCH="${MROG_NOTCH_BIN:-$HOME/.local/bin/mrog-notch}"
+PYSPY="${MROG_PYSPY:-$HOME/.local/bin/py-spy}"
+OUT="${MROG_GUARD_OUT:-${MROG_ROOT:-$HOME/mrog}/audit/freezes}"
+# 🔴 60 WAS UNREACHABLE. The service drop-in 10-guard.conf caps this cgroup at
+# CPUQuota=50%, so a FULLY saturated runaway measures ~50% and never 60% -- the
+# detector's trigger sat above the ceiling imposed on the thing it watches, and the two
+# "independent" containment layers were not independent: layer 1 disabled layer 2.
+# Measured 2026-09-07 (vge-quota-proof.sh), a busy loop in a CPUQuota=50% scope sampled
+# with this script's own cpu_now method: 50.0 50.0 50.0 50.0 50.3 -- five for five below
+# 60. Captures since install: 0. Freeze 3 read the notch at 50.5%, which is not a
+# "partial storm", it is this quota ceiling with a full storm behind it.
+# 25 is chosen from both distributions, not by feel: a healthy notch measured
+# 0.2 0.3 0.5 0.7 0.8 1.0 1.3 1.7 2.0 2.7% across this session and the previous one, so
+# 25 is ~9x above the worst healthy sample and half the quota ceiling. Verified in the
+# same run to fire on the capped runaway and stay silent on an idle process.
+CPU_LIMIT="${MROG_GUARD_CPU:-25}"      # percent of ONE core; MUST stay under CPUQuota
+STRIKES="${MROG_GUARD_STRIKES:-3}"     # consecutive samples over the limit
+WINDOW="${MROG_GUARD_WINDOW:-5}"       # seconds per sample
+ACTION="${MROG_GUARD_ACTION:-restart}" # restart | report
+RATE="${MROG_GUARD_RATE:-20}"          # py-spy samples/sec -- low, it runs always
+# py-spy exits when its --duration expires and TAKES THE NOTCH WITH IT, because
+# the notch is its child. A short rotation therefore restarts the pill on a
+# timer and throws away whatever was typed in the note pad. 7 days means that
+# never happens in practice; the sample map stays small because an idle notch
+# only ever visits a handful of distinct stacks.
+ROTATE="${MROG_GUARD_ROTATE:-604800}"  # seconds per profile chunk (7 days)
+
+CHILD=""; SPY=""; CURPROF=""; strikes=0
+mkdir -p "$OUT"
+
+log() { printf '%s %s\n' "$(date -Is)" "$*"; }
+
+# Instantaneous CPU% of $1 over $WINDOW seconds, from /proc jiffies. Prints an
+# integer, or nothing if the pid vanished -- callers must handle empty.
+cpu_now() {
+  local pid=$1 hz t0 t1 c0 c1
+  hz=$(getconf CLK_TCK)
+  c0=$(awk '{print $14+$15}' "/proc/$pid/stat" 2>/dev/null) || return 1
+  [ -z "$c0" ] && return 1
+  t0=$(date +%s%N)
+  sleep "$WINDOW"
+  c1=$(awk '{print $14+$15}' "/proc/$pid/stat" 2>/dev/null) || return 1
+  [ -z "$c1" ] && return 1
+  t1=$(date +%s%N)
+  awk -v c0="$c0" -v c1="$c1" -v t0="$t0" -v t1="$t1" -v hz="$hz" \
+      'BEGIN{d=(t1-t0)/1e9; if(d<=0){print 0; exit} printf "%d", ((c1-c0)/hz)/d*100}'
+}
+
+capture() {
+  local pid=$1 stamp f prof
+  stamp=$(date +%Y%m%dT%H%M%S)
+  f="$OUT/notch-runaway-$stamp.txt"
+  prof="$OUT/notch-runaway-$stamp.stacks.txt"
+  # SAMPLE THE LIVE PROCESS BEFORE TOUCHING THE PROFILER. Interrupting py-spy
+  # takes the notch down with it, so anything read from /proc afterwards is
+  # empty -- fixture 1 on 2026-09-07 produced a blank per-thread table for
+  # exactly that reason. Order matters more than it looks.
+  local threads ctx
+  threads=$(ps -L -o tid,pcpu,comm -p "$pid" 2>&1)
+  ctx=$(ps -eo pcpu,rss,comm --sort=-pcpu --no-headers 2>/dev/null | head -6)
+  # Flush the profiler SECOND -- py-spy only writes its file when it exits.
+  if [ -n "$SPY" ] && kill -0 "$SPY" 2>/dev/null; then
+    kill -INT "$SPY" 2>/dev/null
+    for _ in $(seq 1 20); do kill -0 "$SPY" 2>/dev/null || break; sleep 0.5; done
+  fi
+  [ -s "$CURPROF" ] && cp "$CURPROF" "$prof"
+  {
+    echo "=== mrog-notch RUNAWAY captured $(date -Is) ==="
+    echo "pid=$pid  cpu_limit=${CPU_LIMIT}%  trigger=${STRIKES}x${WINDOW}s"
+    echo
+    echo "--- per-thread CPU (which thread is spinning) ---"
+    echo "$threads"
+    echo
+    echo "--- desktop context at the moment of capture ---"
+    echo "$ctx"
+    echo
+    echo "--- HOTTEST PYTHON STACKS (this is the whole point) ---"
+    if [ -s "$prof" ]; then
+      sort -k2 -rn "$prof" 2>/dev/null | head -15
+      echo
+      echo "full collapsed profile: $prof"
+    else
+      echo "NO PROFILE CAPTURED -- was py-spy running? expected at $CURPROF"
+    fi
+  } > "$f" 2>&1
+  log "CAPTURED -> $f"
+}
+
+start_child() {
+  CURPROF="$OUT/.notch-live.stacks"
+  CHILD=""; SPY=""
+  if [ -x "$PYSPY" ]; then
+    "$PYSPY" record --rate "$RATE" --duration "$ROTATE" --format raw \
+             -o "$CURPROF" -- "$NOTCH" >/dev/null 2>&1 &
+    SPY=$!
+    for _ in $(seq 1 40); do
+      CHILD=$(pgrep -P "$SPY" 2>/dev/null | head -1)
+      [ -n "$CHILD" ] && break
+      sleep 0.5
+    done
+    log "started mrog-notch pid=${CHILD:-?} UNDER py-spy pid=$SPY (parent, so ptrace is permitted)"
+  else
+    "$NOTCH" & CHILD=$!
+    log "started mrog-notch pid=$CHILD -- py-spy MISSING at $PYSPY, NO STACK WILL BE CAPTURED"
+  fi
+}
+
+# 🔴 A DELIBERATE STOP OUTRANKS THE RESTART POLICY. This guard restarts an UNPLANNED
+# death; a TERM is the operator saying otherwise. Chris's `mrog-pills off` launcher predates
+# this guard, and on 2026-09-07 it could not turn the pills off at all: bash runs a signal
+# trap and then RESUMES, so the old `trap cleanup EXIT INT TERM` killed the child and fell
+# straight into the "child gone; restarting in 5s" branch. The pills came back seconds later,
+# and `systemctl --user stop` never finished -- TimeoutStopSec, SIGKILL, unit left `failed`
+# (journal 18:09:23). EXIT cleans up; INT/TERM clean up AND exit; the loop checks the flag so
+# a signal arriving mid-iteration cannot be raced.
+SHUTTING_DOWN=0
+cleanup() {
+  SHUTTING_DOWN=1
+  [ -n "$SPY" ]   && kill -TERM "$SPY"   2>/dev/null
+  [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null
+  return 0
+}
+on_signal() { log "stop requested -- shutting down, NOT restarting"; cleanup; exit 0; }
+trap cleanup EXIT
+trap on_signal INT TERM
+
+start_child
+while :; do
+  [ "$SHUTTING_DOWN" = 1 ] && exit 0
+  if [ -z "$CHILD" ] || ! kill -0 "$CHILD" 2>/dev/null; then
+    [ "$SHUTTING_DOWN" = 1 ] && exit 0
+    log "child gone; restarting in 5s"
+    [ -n "$SPY" ] && kill -TERM "$SPY" 2>/dev/null
+    sleep 5
+    start_child
+    continue
+  fi
+  c=$(cpu_now "$CHILD") || { strikes=0; continue; }
+  [ -z "$c" ] && { strikes=0; continue; }
+  if [ "$c" -ge "$CPU_LIMIT" ]; then
+    strikes=$((strikes + 1))
+    log "HIGH cpu=${c}% strike ${strikes}/${STRIKES}"
+    if [ "$strikes" -ge "$STRIKES" ]; then
+      log "RUNAWAY confirmed at ${c}%"
+      capture "$CHILD"
+      if [ "$ACTION" = "restart" ]; then
+        kill -TERM "$CHILD" 2>/dev/null; sleep 2; kill -KILL "$CHILD" 2>/dev/null
+        log "ACTION=restart -- notch killed, desktop protected"
+        sleep 3
+        start_child
+      else
+        log "ACTION=report -- left running deliberately"
+      fi
+      strikes=0
+    fi
+  else
+    [ "$strikes" -gt 0 ] && log "cpu back to ${c}% -- strikes cleared"
+    strikes=0
+  fi
+done

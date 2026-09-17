@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# ~/mrog/mrog-freeze-capture -- run this THE MOMENT the desktop freezes.
+#
+# WHY. FLEET-CB2 2026-09-05: Chris reported a freeze, and by the time I looked
+# the machine was healthy again -- normal load, 14 GiB free, swap untouched, X
+# answering, no kernel errors. I formed three hypotheses (a hot notch process,
+# Bluetooth HID write failures, a stuck i915_flip kworker) and had to discard
+# all three on measurement. A freeze that leaves no trace cannot be fixed; it
+# can only be re-guessed. This captures the state WHILE it is happening.
+#
+# It works even when the GUI is dead, because SSH and the shell keep running --
+# which is the whole point. Run it from another machine:
+#     ssh laptop '~/mrog/mrog-freeze-capture'
+# or bind it to a key, or run it from a TTY (ctrl+alt+F3).
+#
+# Everything lands in one timestamped file. Terminal output dies with the
+# window; a freeze report has to outlive the freeze.
+set -uo pipefail
+export DISPLAY="${DISPLAY:-:0}"
+OUT_DIR="${MROG_ROOT:-$HOME/mrog}/audit/freezes"
+mkdir -p "$OUT_DIR"
+F="$OUT_DIR/freeze-$(date +%Y%m%dT%H%M%S).txt"
+
+{
+  echo "=== mrog freeze capture $(date -Is) ==="
+  echo "uptime: $(uptime)"
+  echo
+
+  echo "--- 1. IS X ALIVE? (timeout means the server itself is wedged) ---"
+  timeout 3 xdotool getactivewindow getwindowname 2>&1 || echo "X DID NOT ANSWER IN 3s  <-- server-level stall"
+  echo
+
+  echo "--- 2. IS THE SCREEN REPAINTING? two grabs 3s apart ---"
+  # The decisive test. X can answer queries while the display pipeline has
+  # stopped presenting frames -- that combination IS the classic "frozen but
+  # healthy" case, and it is invisible to load average.
+  t=$(mktemp -d)
+  ffmpeg -hide_banner -loglevel error -f x11grab -video_size "$(xdotool getdisplaygeometry | tr ' ' 'x')" \
+         -i "$DISPLAY" -frames:v 1 -y "$t/a.png" 2>/dev/null
+  sleep 3
+  ffmpeg -hide_banner -loglevel error -f x11grab -video_size "$(xdotool getdisplaygeometry | tr ' ' 'x')" \
+         -i "$DISPLAY" -frames:v 1 -y "$t/b.png" 2>/dev/null
+  if cmp -s "$t/a.png" "$t/b.png"; then
+    echo "IDENTICAL -> NOT REPAINTING. This is a real display stall."
+    cp "$t/a.png" "${F%.txt}.png"
+    echo "frame saved: ${F%.txt}.png"
+  else
+    echo "DIFFERENT -> screen is live. If it LOOKS frozen, suspect ONE window,"
+    echo "not the desktop. See the per-window check in section 7."
+  fi
+  rm -rf "$t"
+  echo
+
+  echo "--- 3. CPU (instantaneous, NOT the ps lifetime average) ---"
+  # ps %CPU is cputime/elapsed since start, so a freshly started process reads
+  # high on startup cost alone. That misled me once already; top -bn1 is what
+  # answers "what is burning CPU RIGHT NOW".
+  top -bn1 2>/dev/null | head -14
+  echo
+
+  echo "--- 4. BLOCKED IN THE KERNEL (D state = waiting on hardware/IO) ---"
+  ps -eo pid,stat,wchan:28,comm,args --sort=-pcpu 2>/dev/null | awk 'NR==1 || $2 ~ /^D/' | head -12
+  echo "(a kworker that CYCLES D<->I is working normally, not stuck --"
+  echo " sample it repeatedly before believing a single snapshot)"
+  echo
+
+  echo "--- 5. MEMORY / SWAP ---"
+  free -h
+  echo
+
+  echo "--- 6. KERNEL: hangs, lockups, GPU resets ---"
+  journalctl -k --since "-15 min" --no-pager 2>/dev/null \
+    | grep -iE "blocked for more than|hung task|soft lockup|gpu hang|reset|i915|drm|nouveau|nvidia" | tail -15
+  echo "(empty here means the kernel saw nothing -- a userspace/compositor"
+  echo " problem, not a driver one)"
+  echo
+
+  echo "--- 7. WHICH WINDOW? unresponsive X clients ---"
+  # A single hung window is the commonest 'my laptop froze'. _NET_WM_PID plus
+  # a D/S state tells you which app to kill instead of rebooting.
+  for w in $(timeout 3 xdotool search --name "." 2>/dev/null | head -20); do
+    n=$(timeout 1 xdotool getwindowname "$w" 2>/dev/null)
+    p=$(timeout 1 xprop -id "$w" _NET_WM_PID 2>/dev/null | awk '{print $3}')
+    [[ "${p:-}" =~ ^[0-9]+$ ]] || p=""
+    [ -n "$p" ] && printf '  win=%s pid=%s state=%s  %s\n' \
+      "$w" "$p" "$(ps -o stat= -p "$p" 2>/dev/null | tr -d ' ')" "${n:0:52}"
+  done
+  echo
+
+  echo "--- 8. COMPOSITOR ---"
+  echo "cinnamon: $(ps -o pcpu=,stat= -C cinnamon 2>/dev/null | head -1)"
+  timeout 3 dbus-send --session --print-reply --dest=org.Cinnamon /org/Cinnamon \
+    org.freedesktop.DBus.Properties.Get string:org.Cinnamon string:OverviewActive 2>&1 | tail -1 \
+    || echo "CINNAMON D-BUS DID NOT ANSWER  <-- shell main loop is blocked"
+  echo
+
+  echo "--- 9. GPU ---"
+  echo "power_state: $(cat /sys/class/drm/card*/device/power_state 2>/dev/null | tr '\n' ' ')"
+  nvidia-smi --query-gpu=name,utilization.gpu,memory.used --format=csv,noheader 2>/dev/null \
+    || echo "dGPU asleep (D3cold) -- display is on the Intel i915"
+  echo
+
+  echo "--- 10. BLUETOOTH INPUT (a failing BT keyboard reads as a freeze) ---"
+  bluetoothctl devices Connected 2>/dev/null
+  journalctl --since "-15 min" --no-pager 2>/dev/null | grep -c "hog-lib.c:output_written_cb" \
+    | sed 's/^/  HID write failures in the last 15 min: /'
+  echo
+  echo "=== end. Recovery options, least destructive first: ==="
+  echo "  1. cinnamon --replace &          restart the shell, keeps your apps"
+  echo "  2. kill the pid from section 7 whose state is D or whose window is dead"
+  echo "  3. xset dpms force off; sleep 2; xset dpms force on   forces a modeset"
+} > "$F" 2>&1
+
+echo "$F"
+grep -E "NOT REPAINTING|DID NOT ANSWER|hung task|soft lockup|gpu hang" "$F" \
+  | sed 's/^/  >> /' || echo "  (no smoking gun in the automated checks -- read the file)"

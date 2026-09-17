@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# ask-agent — read or change which agent the ASK pill (and ask-now) will send to.
+#
+# The pill writes ~/.askbar/selected on click; this is the same switch for people who reach for
+# the leader menu instead. Both write the SAME file, so the pill's dot and this always agree --
+# there is deliberately no second source of truth.
+set -uo pipefail
+SEL="$HOME/.askbar/selected"; REG="${ASKBAR_REGISTRY:-${MROG_ROOT:-$HOME/mrog}/askbar/agents.yml}"
+mkdir -p "$(dirname "$SEL")"
+ids=$(python3 -c "import yaml;print(' '.join(a['id'] for a in yaml.safe_load(open('$REG'))['agents']))" 2>/dev/null)
+[ -n "$ids" ] || { echo "no registry at $REG"; exit 1; }
+cur=$(cat "$SEL" 2>/dev/null); cur=${cur:-$(echo $ids | awk '{print $1}')}
+label() { python3 -c "
+import yaml,sys
+for a in yaml.safe_load(open('$REG'))['agents']:
+    if a['id']==sys.argv[1]:
+        print('%s  (%s)%s' % (a['label'], a['model'], '' if a['vision'] else '  [text only]')); break" "$1" 2>/dev/null; }
+case "${1:---show}" in
+  --next)
+    nxt=""; first=""; take=0
+    for i in $ids; do [ -z "$first" ] && first=$i; if [ $take = 1 ]; then nxt=$i; break; fi; [ "$i" = "$cur" ] && take=1; done
+    [ -z "$nxt" ] && nxt=$first
+    printf '%s' "$nxt" > "$SEL"
+    msg="ask → $(label "$nxt")"
+    command -v notify-send >/dev/null && notify-send -u low "Ask agent" "$msg"
+    echo "$msg" ;;
+  --set) [ -n "${2:-}" ] || { echo "usage: ask-agent --set <id>"; exit 1; }
+    printf '%s' "$2" > "$SEL"; echo "ask → $(label "$2")" ;;
+  *) msg="ask → $(label "$cur")"
+     command -v notify-send >/dev/null && notify-send -u low "Ask agent" "$msg"
+     echo "$msg" ;;
+esac

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# ask-shell — the window an ASK opens into. Runs INSIDE the gnome-terminal `ask` spawns.
+#
+# usage: ask-shell AGENT ASK_HOST FIRST_CMD
+#   AGENT      registry id (hermes claude dreamzs)
+#   ASK_HOST   the registry's ask_host — "local" or an ssh target; follow-ups go to the same place
+#   FIRST_CMD  the fully built dispatch line `ask` used to run directly (ssh -t … included)
+#
+# WHY THIS FILE EXISTS (FLEET-4HY, 2026-09-16). Until now the window was
+#     bash -c "$DISPATCH_INNER; echo; read -rp 'enter to close '"
+# so an agent whose ask_cmd is a ONE-SHOT (hermes -z, dreamzs -c) answered and the window was a
+# dead end: no way to ask the next question, and for hermes the conversation was already SAVED
+# on the Mini -- there was simply no door back into it. Chris's words: "opens a 1 shot window,
+# shows you what you asked for and closes."
+#
+# The registry decides how a row continues (`followup:`):
+#   native   the first command IS a REPL (claude) or holds the terminal itself after answering
+#            (dreamzs --stay). Nothing to add: run it, then the old "enter to close".
+#   resume   the first command is a one-shot that persists a session the agent can resume
+#            (hermes). After it prints, fetch the session id with `sid_cmd`, then loop:
+#              empty line   -> close (the same gesture as before, so nothing changes for a plain ask)
+#              /session     -> hand the window to the agent's full REPL on THIS thread (session_cmd)
+#              anything     -> next turn of the same conversation (followup_cmd), same formatting
+#
+# 🔴 THE FOLLOW-UP TEXT GOES OVER STDIN, NEVER ARGV. 13-ask-bar.md "The command carries a
+# reference, not the question": a quoted string through bash -> ssh -> zsh produced
+# $'what\ do\ you...' and a fresh bug per edit. stdin passes through ssh untouched, and hermes's
+# `--query-file -` is documented as "nothing is shell-interpreted". Same trap, same fix.
+#
+# 🔴 THE ID IS FETCHED ONCE, RIGHT AFTER THE FIRST ANSWER, AND PINNED. `--resume latest` is
+# workspace-scoped and re-evaluated on every call, so a gateway or cron turn landing mid-thread
+# could redirect the second follow-up into a different conversation. `sid_cmd` filters
+# --source cli and runs within seconds of the one-shot; every later turn names that id.
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+REG="$HERE/agents.yml"
+AGENT="${1:-}"; HOST="${2:-local}"; FIRST="${3:-}"
+[ -n "$AGENT" ] && [ -n "$FIRST" ] || { echo "ask-shell: usage: ask-shell AGENT ASK_HOST FIRST_CMD"; exit 2; }
+
+meta="$(python3 "$HERE/_reg.py" get "$REG" "$AGENT" 2>&1)" || { echo "ask-shell: $meta"; read -rp 'enter to close '; exit 1; }
+eval "$meta"   # A_LABEL A_MODEL A_FOLLOWUP A_FOLLOWUP_CMD A_SESSION_CMD A_SID_CMD (+ the rest)
+
+# ---- 1. the first answer: EXACTLY what the window did before this file existed --------------
+bash -c "$FIRST"
+
+if [ "${A_FOLLOWUP:-native}" != resume ]; then
+  echo; read -rp 'enter to close '; exit 0
+fi
+
+# ---- 2. resume rows: pin the session, then loop ---------------------------------------------
+# Same local-vs-ssh split `ask` makes. `ask` already resolved alias/hostname ambiguity into
+# HOST=local for a local row, so a literal compare is enough here.
+remote()     { if [ "$HOST" = local ]; then bash -c "$1"; else ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" "$1"; fi; }
+remote_tty() { if [ "$HOST" = local ]; then bash -c "$1"; else ssh -t "$HOST" "$1"; fi; }
+
+sid="$(remote "$A_SID_CMD" 2>/dev/null </dev/null | tail -1 | tr -d '[:space:]')"
+if [ -z "$sid" ]; then
+  echo; echo "── ${A_LABEL}: answered, but the session id could not be read (sid_cmd on ${HOST})."
+  echo "   Follow-up is unavailable for this ask; the thread is still saved on ${HOST}."
+  read -rp 'enter to close '; exit 0
+fi
+
+follow="${A_FOLLOWUP_CMD//\{sid\}/$sid}"
+session="${A_SESSION_CMD//\{sid\}/$sid}"
+rule="$(printf '%*s' "$(( ${COLUMNS:-80} > 100 ? 100 : ${COLUMNS:-80} ))" '' | tr ' ' '─')"
+while :; do
+  echo; echo "$rule"
+  echo "${A_LABEL} · follow up?  (Enter = close · /session = open the full REPL on this thread · id ${sid})"
+  IFS= read -rep '> ' q || { echo; break; }
+  case "$q" in
+    "")         break ;;
+    /session)   echo; remote_tty "$session"; break ;;
+    *)          echo; printf '%s' "$q" | remote "$follow" ;;
+  esac
+done

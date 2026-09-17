@@ -1,0 +1,634 @@
+#!/usr/bin/env bash
+# ask — LAYER 1 of the Ask Bar. Capture something, redact it, drop it where an agent can read
+# it, and hand back a paste-ready reference. No GUI: the bar (layer 2) is a thin caller of this.
+#
+# WHY A FILE AND A PATH, AND NOT A PER-AGENT INTEGRATION
+#   All five agents can read a file. Only four speak MCP, Dreamzs needs its own shape, and every
+#   integration rots separately. A path is the lowest common denominator and it is universal.
+#   Per-agent RULES then become WHERE THE FILE LANDS -- which is governance we already have:
+#   Hermes's drop is the spine inbox (agent-read-only, one-way, ACL-enforced).
+#
+# 🔴 CHRIS-INITIATED ONLY. There is deliberately no daemon and no agent-callable entry point.
+#   Chris-initiated capture is him SHOWING something. Agent-initiated capture is an agent READING
+#   HIS SCREEN on its own -- logged-in sessions, password managers, other agents' output. For
+#   Hermes that is law-1-adjacent and would need its own ruling. Do not add an MCP wrapper around
+#   this for an agent that agents.yml constrains.
+#
+# FAILURE CLASS THIS CATCHES (CLAUDE.md Rule 8 clause 5)
+#   "A screen capture carrying a live credential is dropped somewhere an agent, a log, or a
+#    backup can read it." A screenshot of a terminal can contain an sk- key, a bearer token, a
+#    .env. ship.sh already refuses those by name and content for FILES; a PNG defeats that
+#    because the secret is pixels. So every capture is OCR'd and the TEXT is scanned before the
+#    image is allowed to land. NOT the class "the image is ugly" or "OCR was imperfect" --
+#    imperfect OCR is why the default on a hit is REFUSE, not blur.
+#
+# Verdict is the printed WORD: OK / REFUSED / FAILED. Never the exit code.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REG="${ASKBAR_REGISTRY:-$HERE/agents.yml}"
+# 🔴 STAGING MUST NOT BE A DROP DIR. It defaulted to ~/asks, which IS claude's drop, so a
+# capture REFUSED by the secret scan still landed where the agent reads. The refusal
+# printed "nothing was dropped" while the file sat in the drop directory. Staging is now
+# private (0700) and separate; only an ACCEPTED capture is copied to a drop.
+STORE="${ASKBAR_STORE:-$HOME/.askbar/staging}"
+AGENT=""; MODE="region"; TEXT=""; NEW_SESSION=0; FORCE=0; PREPARED=""; OPEN=0; DRYOPEN=0; INTENT=""
+
+usage() { cat <<'U'
+usage: ask --to AGENT [--window|--region|--screen|--none] [--text "..."] [--new-session]
+  --to AGENT      id from agents.yml (see --list)
+  --window        capture the focused window        --region  drag-select a region (default)
+  --screen        whole screen                      --none    no capture, text only
+  --page          the ACTIVE WINDOW\'S WHOLE DOCUMENT via accessibility -- everything below
+                  the fold too. No screenshot, no scrolling, no clipboard. Use this for a
+                  long thread or article, where a screenshot only ever gets the viewport.
+  --new-session   also open a window into that agent
+  --force         drop even if the secret scan flags it (records WHY in the sidecar)
+  --list          print the registry and exit
+U
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --to) AGENT="${2:-}"; shift 2;;
+    --window) MODE=window; shift;; --region) MODE=region; shift;;
+    --screen) MODE=screen; shift;; --none) MODE=none; shift;;
+    --page) MODE=page; shift;;
+    --text) TEXT="${2:-}"; shift 2;;
+    --new-session) NEW_SESSION=1; shift;;
+    --open) OPEN=1; shift;;
+    # An INTENT is what you want; a MODE is how you grabbed it. Welding them together is
+    # what made the first pad fire before Chris was ready.
+    --intent) INTENT="${2:-}"; shift 2;;
+    --intents) python3 "$HERE/_reg.py" intents "$REG"; exit 0;;
+    # Print the command instead of spawning. Added because "hiding" gnome-terminal
+    # from PATH did not hide it -- /usr/bin was still on the path -- so the test
+    # silently opened two real windows instead of showing what it would run.
+    --dry-open) OPEN=1; DRYOPEN=1; shift;;
+    --force) FORCE=1; shift;;
+    # --prepared: the bar (layer 2) already cropped a window with GdkPixbuf, so layer 1 must
+    # NOT capture again. Everything downstream -- OCR, the secret scan, the drop -- is
+    # identical; only the source of the pixels differs.
+    --prepared) PREPARED="${2:-}"; MODE=prepared; shift 2;;
+    --list) python3 "$HERE/_reg.py" list "$REG"; exit 0;;
+    -h|--help) usage; exit 0;;
+    *) echo "FAILED — unknown arg: $1"; usage; exit 0;;
+  esac
+done
+
+[ -n "$AGENT" ] || { echo "FAILED — --to AGENT is required"; usage; exit 0; }
+if [ -n "$INTENT" ]; then
+  ipr="$(python3 "$HERE/_reg.py" prompt "$REG" "$INTENT" 2>/dev/null)" || {
+    echo "FAILED — no such intent: $INTENT"; python3 "$HERE/_reg.py" intents "$REG" | cut -f2 | paste -sd' ' | sed 's/^/    have: /'; exit 0; }
+  # The intent leads; anything Chris typed is appended as his own words, not merged into it.
+  TEXT="${ipr}${TEXT:+
+
+My note: $TEXT}"
+fi
+meta="$(python3 "$HERE/_reg.py" get "$REG" "$AGENT" 2>&1)" || { echo "FAILED — $meta"; exit 0; }
+eval "$meta"   # sets A_LABEL A_COLOR A_MODEL A_VISION A_VISION_BAD A_DROP A_DROPVIA A_LAUNCH
+# 🔴 A REGISTRY DEFECT MUST BE AUDIBLE, NOT ONLY SAFE. _reg.py already failed this closed (a
+# non-bool `vision` means NO IMAGE), but a silent safe default is how the same edit gets made
+# again next month. _regcheck.py refuses it statically; this says it at the moment of use.
+if [ -n "${A_VISION_BAD:-}" ]; then
+  echo "⚠️ registry defect — '${AGENT}' vision is ${A_VISION_BAD}, not a YAML bool."
+  echo "    Treating it as NO VISION (fail-closed): no .png will be sent."
+  echo "    Fix the row in agents.yml, then: python3 ${HERE}/_regcheck.py ${REG}"
+fi
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$STORE" "$HOME/.askbar"; chmod 700 "$STORE" 2>/dev/null
+
+# ---- THE PILL'S STATE AND THE PRINTED VERDICT ARE ONE DECISION ------------------------------
+# 🔴 The pill (askpill.py:316) greens on the literal word "ok" in ~/.askbar/last and dims on
+# anything else. Until 2026-09-07 only two of this script's exits ever wrote that file -- "ok"
+# and "refused" -- so EVERY "FAILED" path (capture produced nothing, drop refused, the dispatch
+# preflight below) left the PREVIOUS run's "ok" sitting there and the pill stayed green through a
+# failure. Same green-by-construction shape as the OK-before-the-spawn bug, one layer out. The
+# trap makes it structural instead of remembered: any exit that has not already published a
+# verdict publishes "failed". Guarded on $AGENT so --list/--help/--intents, which legitimately
+# exit before there is a route to report on, do not stamp the pill.
+ASK_STATUS_DONE=0
+note_status() {
+  printf '%s\t%s\t%s\n' "$(date -u +%H:%M:%SZ)" "$AGENT" "$1" > "$HOME/.askbar/last" 2>/dev/null
+  ASK_STATUS_DONE=1
+}
+trap '[ "$ASK_STATUS_DONE" -eq 0 ] && [ -n "${AGENT:-}" ] && \
+      printf "%s\t%s\t%s\n" "$(date -u +%H:%M:%SZ)" "$AGENT" "failed" \
+      > "$HOME/.askbar/last" 2>/dev/null' EXIT
+png="$STORE/ask_${stamp}_${AGENT}.png"
+txt="$STORE/ask_${stamp}_${AGENT}.txt"
+
+# Shared by the drop path and the ask path -- both compare a registry ALIAS to this machine.
+is_local_host() {
+  local h="$1" a
+  [ "$h" = local ] || [ "$h" = localhost ] && return 0
+  [ "$h" = "$(hostname -s 2>/dev/null)" ] || [ "$h" = "$(hostname 2>/dev/null)" ] && return 0
+  # Resolve through ssh -G as well as DNS: the registry uses SSH ALIASES ("hub"),
+  # which getent cannot resolve because they exist only in ~/.ssh/config. ssh -G reads that
+  # same config and prints the real hostname without connecting.
+  local resolved; resolved="$(ssh -G "$h" 2>/dev/null | awk '/^hostname /{print $2; exit}')"
+  for a in $(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}'; \
+             getent ahostsv4 "${resolved:-$h}" 2>/dev/null | awk '{print $1}'; \
+             printf '%s\n' "${resolved:-}"); do
+    [ -n "$a" ] || continue
+    ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qx "$a" && return 0
+  done
+  return 1
+}
+
+# ---- GRAB SAFETY -----------------------------------------------------------------------
+# 🔴 THE FAILURE THIS PREVENTS, MEASURED 2026-09-06: `flameshot gui` takes an X pointer AND
+# keyboard grab to draw its selection overlay. If it hangs -- no display to draw on, a wedged
+# compositor, anything -- the grab is NEVER released and the whole desktop is frozen. A GRAB
+# SURVIVES A COMPOSITOR RESTART, so `cinnamon --replace` does nothing and the obvious fix looks
+# like it failed. It froze Chris's laptop, and the recovery cost him 22 hours of session state
+# because the wrong process was killed while chasing it.
+#
+# Two guards, both cheap:
+#   1. REFUSE to start a second capture while one is already running. Stacking grabs is how a
+#      recoverable hang becomes an unrecoverable one.
+#   2. Every interactive capture runs under `timeout`. On expiry the tool is killed, which
+#      releases the grab. A capture that needs more than CAPTURE_TIMEOUT seconds of pointing is
+#      a hang, not a slow user.
+CAPTURE_TIMEOUT="${ASKBAR_CAPTURE_TIMEOUT:-45}"
+
+# Match the EXECUTABLE NAME, not a cmdline substring. `pgrep -f` matched this script's own
+# test command line, and would match any shell line merely mentioning flameshot. A guard that
+# false-positives is a guard that gets switched off. `pgrep -x` compares the process name only.
+grab_holder() {
+  # 🔴 pgrep -x CANNOT SEE gnome-screenshot. Linux truncates the comm field to 15 chars and
+  # pgrep refuses longer patterns outright:
+  #   "pattern that searches for process name longer than 15 characters will result in
+  #    zero matches"
+  # gnome-screenshot is 16. So the guard built to prevent an X-grab freeze was blind to one of
+  # the two tools that can cause one. Found 2026-09-06 by reading pgrep's own stderr, which had
+  # been discarded until then.
+  #
+  # /proc/PID/exe is the real executable, has no length limit, and cannot be spoofed by a
+  # command line that merely MENTIONS the name -- which is why this is not `pgrep -f`.
+  local pid exe
+  for pid in /proc/[0-9]*; do
+    exe="$(readlink "$pid/exe" 2>/dev/null)" || continue
+    case "${exe##*/}" in
+      flameshot)
+        # 🔴 TRAY-RESIDENT IS NOT MID-GRAB. MEASURED 2026-09-08: flameshot had been up 8h14m
+        # as the tray applet, holding NO grab (xdotool getmouselocation answered fine), and
+        # this guard refused EVERY ask for those eight hours -- reported to Chris as a
+        # credential warning, because ask-pick collapsed both refusals into one message.
+        # Existence was standing in for the claim "a grab is held", and it is not the same
+        # claim. flameshot is the only tool in this list with a resident daemon mode, and its
+        # argv decides it exactly: bare `/usr/bin/flameshot` is the tray; a capture is always
+        # `flameshot gui|screen|full|launcher`. This reads ARGUMENTS, not the name -- the
+        # /proc/exe check above still decides IDENTITY, so a process merely mentioning
+        # "flameshot" still cannot match.
+        case " $(tr '\0' ' ' < "$pid/cmdline" 2>/dev/null) " in
+          *" gui "*|*" screen "*|*" full "*|*" launcher "*)
+            printf '%s' "${pid##*/}"; return 0 ;;
+        esac ;;
+      slurp|grim|gnome-screenshot|spectacle|maim|scrot|import)
+        # These have no daemon mode: they exist only while capturing, so existence IS the grab.
+        printf '%s' "${pid##*/}"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+pre_capture_guard() {
+  local pid; pid="$(grab_holder)"
+  [ -z "$pid" ] && return 0
+  echo "REFUSED — a capture tool is already running (pid $pid) and may be holding an X grab."
+  echo "    Starting another would stack grabs and make the freeze harder to clear."
+  echo "    Clear it first:  ~/bin/mrog-unfreeze        (or: kill $pid)"
+  return 1
+}
+
+# `none` captures nothing; `page` captures TEXT but no pixels. Everything png-shaped keys
+# off this single predicate.
+has_image() { [ "$MODE" != none ] && [ "$MODE" != page ]; }
+
+# 🔴 `vision` IS WIRING, NOT A LABEL -- and until 2026-09-07 only ONE of the three png-shaped
+# decisions consulted it. The copy to the drop was gated on has_image ALONE, so a text-only
+# agent was shipped a .png it cannot open; for Hermes that .png landed in an ACL'd ONE-WAY
+# inbox it can never delete. One predicate now decides all three: whether the image is copied,
+# whether the sidecar names it, and whether the clipboard reference points at it.
+# 🔴 AND IT IS COMPARED AS TEXT, WHICH IS ONE PAIR OF QUOTES AWAY FROM REOPENING THE BUG.
+# _reg.py hands this over as str(row["vision"]), so a real YAML bool arrives as "True"/"False"
+# -- but a row written `vision: "false"` arrives as "false", which != "False", and the old
+# one-line test read that as VISION AND SHIPPED THE PNG. Measured 2026-09-07: _regcheck.py
+# returned PASS on exactly that registry while ask dropped a .png for a text-only agent.
+# _regcheck.py now refuses a non-bool statically; this refuses it again at run time, because a
+# static check nobody ran is not a guard.
+# 🎯 IT FAILS CLOSED TOWARD *NOT* SENDING. Send only on an explicitly TRUE value; anything
+# unrecognised means no image. The two mistakes are not symmetrical: a vision agent that gets
+# only the OCR sidecar is degraded, while a text-only agent that gets a .png has an unopenable
+# file -- and for hermes that file lands in an ACL-ed one-way inbox it can never delete.
+# 🔴 ONE PREDICATE, ONE VOCABULARY. This function used to lowercase A_VISION and accept
+# true|1|yes|on, while the sidecar NOTE fifteen lines below compared it literally against
+# "False". Two readings of one field, and they DISAGREED on exactly the value that caused the
+# original bug: MEASURED 2026-09-07, `vision: "false"` in quotes made send_png say no (right)
+# and made the NOTE vanish (wrong), so a text-only agent got the OCR sidecar with nothing
+# telling it the text WAS the payload. The coercion now happens once, in _reg.py, which emits
+# the literal word True only for a real YAML bool True and sets A_VISION_BAD otherwise. Both
+# call sites ask this one question.
+agent_can_see() { [ "${A_VISION:-False}" = True ]; }
+send_png() { has_image && agent_can_see; }
+
+# ---- capture backend, chosen by what the session actually is -------------------------------
+capture() {
+  if [ -n "${WAYLAND_DISPLAY:-}" ] || [ "${XDG_SESSION_TYPE:-}" = wayland ]; then
+    case "$MODE" in
+      region) command -v slurp >/dev/null && timeout "$CAPTURE_TIMEOUT" sh -c 'grim -g "$(slurp)" "$1"' _ "$png" ;;
+      window) command -v hyprctl >/dev/null && grim -g "$(hyprctl activewindow -j | python3 -c 'import json,sys;w=json.load(sys.stdin);print("%d,%d %dx%d"%(w["at"][0],w["at"][1],w["size"][0],w["size"][1]))')" "$png" ;;
+      screen) grim "$png" ;;
+    esac
+  else
+    case "$MODE" in
+      region) command -v flameshot >/dev/null && timeout "$CAPTURE_TIMEOUT" flameshot gui --raw > "$png" 2>/dev/null ;;
+      window) command -v xdotool >/dev/null && import -window "$(xdotool getactivewindow)" "$png" 2>/dev/null \
+              || timeout "$CAPTURE_TIMEOUT" gnome-screenshot -w -f "$png" ;;
+      screen) timeout "$CAPTURE_TIMEOUT" gnome-screenshot -f "$png" 2>/dev/null || import -window root "$png" ;;
+    esac
+  fi
+  [ -s "$png" ]
+}
+
+page_text=""
+if [ "$MODE" = page ]; then
+  # 🎯 NO GRAB AT ALL. This is the one capture mode that cannot freeze the desktop: it reads
+  # the accessibility tree, takes no pointer or keyboard grab, and never runs a capture tool.
+  WIN_TEXT="${WIN_TEXT:-$HOME/bin/win-text}"
+  [ -x "$WIN_TEXT" ] || { echo "FAILED — win-text not found at $WIN_TEXT"; exit 0; }
+  # Resolve the window ONCE, here, and pass it down. The pill spawns ask asynchronously, so
+  # focus can move between the click and the read -- without this you silently capture
+  # whatever the user happened to click on next. ASK_WIN lets a test target a window
+  # without stealing focus from whoever is actually using the desktop.
+  ask_wid="${ASK_WIN:-$(xdotool getactivewindow 2>/dev/null)}"
+  page_text="$("$WIN_TEXT" ${ask_wid:+--win "$ask_wid"} 2>/tmp/.asktext.err)"
+  if [ -z "$page_text" ]; then
+    echo "FAILED — accessibility returned no text for the active window."
+    sed 's/^/    /' /tmp/.asktext.err 2>/dev/null | head -3
+    echo "    Check: gsettings get org.cinnamon.desktop.interface toolkit-accessibility"
+    echo "    A partial capture is NOT substituted here on purpose -- text that looks"
+    echo "    complete but is not makes the agent answer confidently about what it never saw."
+    rm -f /tmp/.asktext.err; exit 0
+  fi
+  rm -f /tmp/.asktext.err
+fi
+
+if [ "$MODE" = prepared ]; then
+  [ -s "$PREPARED" ] || { echo "FAILED — --prepared file is missing or empty: $PREPARED"; exit 0; }
+  cp "$PREPARED" "$png" || { echo "FAILED — could not take the prepared capture"; exit 0; }
+elif has_image; then
+  pre_capture_guard || exit 0
+  if ! capture; then
+    # A timeout here means the tool was killed mid-grab. Say so plainly and point at the
+    # recovery, because the symptom the user sees is a frozen desktop, not an error message.
+    still="$(grab_holder)"
+    echo "FAILED — capture produced nothing (mode=$MODE, session=${XDG_SESSION_TYPE:-x11})."
+    if [ -n "$still" ]; then
+      echo "    ⚠️ a capture tool is STILL running (pid $still) and may hold an X grab."
+      echo "    Run:  ~/bin/mrog-unfreeze"
+    else
+      echo "    No grab left behind (the timeout killed the tool cleanly)."
+    fi
+    exit 0
+  fi
+fi
+
+# ---- OCR sidecar. REQUIRED, not optional: Dreamzs has no mmproj and cannot see an image ------
+ocr=""
+if [ "$MODE" = page ]; then
+  ocr="$page_text"
+elif has_image && command -v tesseract >/dev/null 2>&1; then
+  ocr="$(tesseract "$png" - 2>/dev/null | sed 's/[[:space:]]\+$//')"
+fi
+
+# ---- SECRET SCAN over the OCR text, before anything lands ----------------------------------
+hits="$(printf '%s' "$ocr" | grep -oEi 'sk-[A-Za-z0-9]{16,}|xoxb-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{16,}|AIza[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|Authorization: *Bearer +[A-Za-z0-9._-]{10,}|(api[_-]?key|secret[_-]?key|access[_-]?token)[\"'"'"' ]*[:=][\"'"'"' ]*[A-Za-z0-9._-]{12,}' 2>/dev/null | head -5)"
+if [ -n "$hits" ] && [ "$FORCE" -eq 0 ]; then
+  note_status refused
+  echo "REFUSED — the capture appears to contain a credential; nothing was dropped."
+  printf '%s\n' "$hits" | sed 's/^/    matched: /' | cut -c1-90
+  echo "    kept locally at $png (not shared). Re-run with --force to drop it anyway,"
+  echo "    or recapture without that region. See SECRET_TIERS.md before forcing."
+  exit 0
+fi
+
+# ---- WHERE THIS LANDS -- resolved BEFORE the sidecar is written ----------------------------
+# 🔴 THE FAILURE THIS FIXES, MEASURED 2026-09-07: the sidecar's "image:" line named $png, which
+# is the CAPTURING machine's private staging dir ($HOME/.askbar/staging) and exists on NO
+# agent's machine. Still on disk as evidence --
+#   hub:/home/hubuser/asks/ask_20260906T194040Z_claude.txt ends
+#     image: /home/USER/.askbar/staging/ask_20260906T194040Z_claude.png
+# while the png itself sat right beside the .txt in /home/hubuser/asks. The agent was
+# handed a path only the LAPTOP could resolve. Same class as the dreamzs drop bug: a path that
+# is correct where it is WRITTEN and meaningless where it is READ. Resolve the destination once,
+# here, and let both the sidecar and the drop use it -- one computation, no second copy to drift.
+drop_host="${A_DROP%%:*}"; drop_path="${A_DROP#*:}"
+[ "$drop_host" = "$A_DROP" ] && { drop_host="local"; drop_path="$A_DROP"; }
+
+# 🔴 A DROP PATH MUST BE ABSOLUTE. This is the invariant that makes every other path decision in
+# this script safe, so it is asserted rather than assumed. A "~/asks" drop was silently rewritten
+# to a RELATIVE remote path (the old rpath="${path#\~/}") and then resolved against whatever
+# directory the agent happened to be standing in -- which is precisely how dreamzs read
+# .../dreamzs-redteam/dreamzs-redteam/asks and how Hermes was handed a bare "inbox/ask_....md"
+# that only worked because the model guessed the spine root from its own SOUL.md. A route that
+# depends on the agent guessing is not a route. _regcheck.py enforces the same rule statically.
+case "$drop_path" in
+  /*) : ;;
+  *) echo "FAILED — ${A_LABEL}'s drop is not an absolute path: ${A_DROP}"
+     echo "    A relative drop resolves against the agent's cwd, which nothing here controls."
+     echo "    Fix the row in agents.yml: drop must be HOST:/absolute/path."
+     exit 0 ;;
+esac
+if is_local_host "$drop_host"; then DROP_LOCAL=1; else DROP_LOCAL=0; fi
+
+# The names the files carry AT THE DESTINATION. `spine_md` is the Hermes spine convention
+# (ask_<stamp>.md, no agent suffix); everything else keeps the staging basename.
+case "$A_DROPVIA" in
+  spine_md) txt_name="ask_${stamp}.md";           png_name="ask_${stamp}.png" ;;
+  *)        txt_name="ask_${stamp}_${AGENT}.txt"; png_name="ask_${stamp}_${AGENT}.png" ;;
+esac
+img_ref="${drop_path}/${png_name}"
+
+{
+  echo "# ask ${stamp} -> ${A_LABEL}"
+  echo
+  echo "Captured by ask (layer 1) on $(hostname -s) at $(date -u +%Y-%m-%dT%H:%M:%SZ), mode=$MODE."
+  echo "Chris-initiated. Point-in-time: describes the screen at that instant, nothing later."
+  agent_can_see || echo "NOTE: ${A_LABEL} has no vision backend — the text below IS the payload, not a caption."
+  [ -n "$hits" ] && echo "⚠️ FORCED past the secret scan. Matches were found and Chris overrode. Treat as sensitive."
+  echo
+  [ -n "$TEXT" ] && { echo "## Chris asks"; echo; echo "$TEXT"; echo; }
+  if [ "$MODE" = page ]; then
+    echo "## Page text (accessibility — the WHOLE document, not just what was on screen)"; echo
+    echo '```'; printf '%s\n' "$ocr"; echo '```'
+    echo
+    echo "_Read from the accessibility tree of the front window, so content below the fold is"
+    echo "included. There is no image for this mode._"
+  elif has_image; then
+    echo "## Screen text (OCR)"; echo
+    if [ -n "$ocr" ]; then echo '```'; printf '%s\n' "$ocr"; echo '```'
+    # 🔴 THESE ARE TWO DIFFERENT FACTS AND THE OLD LINE ASSERTED THE WRONG ONE. It printed
+    # "tesseract not installed" whenever $ocr was empty -- measured 2026-09-07 on a laptop where
+    # tesseract IS at /usr/bin/tesseract; the capture simply held no text. For a vision:false
+    # agent this sidecar IS the payload, so telling it the OCR tool is missing when the truth is
+    # "there was nothing to read" invites exactly the wrong recovery.
+    elif ! command -v tesseract >/dev/null 2>&1; then
+      echo "_(no OCR: tesseract is not installed on $(hostname -s) — install it, or this capture"
+      echo "is image-only and a text-only agent gets nothing from it.)_"
+    else echo "_(OCR ran and found no readable text in this capture.)_"; fi
+    # 🔴 THE PATH AS THE AGENT WILL SEE IT, not as the capturing machine sees it -- and only
+    # when the agent can actually open it. A text-only agent gets a sentence instead, because a
+    # dangling "image:" line invites it to claim it looked at something it never had.
+    if send_png; then echo; echo "image: $img_ref"
+    else echo; echo "_(no image was sent: ${A_LABEL} has no vision backend, so the OCR above is"
+         echo "the entire payload. There is no .png to open.)_"; fi
+  fi
+} > "$txt"
+
+# 🔴 MODE 600 ON EVERYTHING THAT LEAVES THIS MACHINE, AND THE REASON IS THE HERMES SPINE.
+# Two lanes drop into mini:/opt/hermes/inbox and until 2026-09-07 they disagreed: this one
+# landed -rw-r--r--+ (staging inherits umask 0002 and scp carries the source mode -- MEASURED
+# on all three drop hosts that day) while ~/ceo-tools/hermes_capture.sh landed -rw-------+
+# because it stages through mktemp. Both are readable by the agent, because the inbox ACL is
+# what grants that read, not the POSIX bits -- also measured 2026-09-07, as agentuser:
+# a 0600 file READ_OK, a write DENIED, a delete DENIED. So the world-readable half bought
+# nothing and widened who can read a photograph of Chris's screen. 600 is the correct mode for
+# an ACL-governed one-way agent inbox: the ACL is the only grant, least privilege everywhere
+# else. Tightening, never widening -- the ACL itself is untouched.
+# scp propagates the source mode, so setting it HERE fixes every drop host in one place; the
+# remote sha check below re-asserts it anyway, for a host where that ever stops being true.
+chmod 600 "$txt" 2>/dev/null
+[ -f "$png" ] && chmod 600 "$png" 2>/dev/null
+
+# What the clipboard reference should POINT AT. The image only when there IS one and the
+# agent can actually see it -- `page` mode produces no png at all, so a vision agent was
+# handed a path to a file that was never created. Two sites chose this on A_VISION alone;
+# both now ask the same question in one place.
+ref_base() { if send_png; then printf '%s' "$png_name"; else printf '%s' "$txt_name"; fi; }
+
+# ---- drop, per the registry's per-agent boundary --------------------------------------------
+# 🔴 ONE COPY PATH FOR EVERY AGENT. Until 2026-09-07 `drop_via: hermes_capture` had its own
+# hand-rolled branch that HARDCODED mini:/opt/hermes/inbox twice and never read the row's
+# `drop` at all -- so editing the registry for hermes changed nothing, and the name promised a
+# "proven one-way, sha-verified drop" while the code was a bare scp with stderr discarded and no
+# verification of any kind. Two lies in one field. Both are gone: the value is renamed to
+# `spine_md`, which now means EXACTLY ONE THING -- name the file .md, per the spine inbox
+# convention -- and WHERE it goes comes from `drop`, like every other row. (This is the only
+# consumer of drop_via in the tree: grep 2026-09-07 found ask:1, _reg.py passthrough, _regcheck
+# key-presence. Nothing else keys off the old name.)
+#
+# 🔴 AND THE COPY IS VERIFIED, FOR EVERY REMOTE ROW, NOT JUST HERMES. scp's exit status says the
+# transfer was ACCEPTED, not that the bytes on the far side match -- and a half-written sidecar
+# in an agent-read-only inbox cannot be repaired by the agent, it can only be answered
+# confidently. ~/ceo-tools/hermes_capture.sh has verified sha since it was written; there was no
+# reason that guarantee stopped at one row. sha256sum||shasum keeps it portable across the Linux
+# and macOS ends of this fleet.
+ref=""
+if [ "$DROP_LOCAL" -eq 1 ]; then
+  # 🔴 A REGISTRY ALIAS IS NOT A HOSTNAME. The registry says "hub:" because that is the ssh
+  # alias Chris uses, but Hub's own `hostname -s` is "hubuser" -- so a run ON
+  # Hub did not recognise itself, tried to scp to hub, and failed with "could not
+  # drop to hub:asks". is_local_host() treats a host as local if it matches the hostname OR
+  # resolves to an address this machine holds.
+  mkdir -p "$drop_path" 2>/dev/null
+  send_png && cp "$png" "$drop_path/$png_name" 2>/dev/null
+  if ! cp "$txt" "$drop_path/$txt_name" 2>/dev/null; then
+    echo "FAILED — could not drop to $drop_path"; exit 0
+  fi
+  chmod 600 "$drop_path/$txt_name" 2>/dev/null
+  send_png && chmod 600 "$drop_path/$png_name" 2>/dev/null
+  ref="$drop_path/$(ref_base)"
+else
+  ssh -o BatchMode=yes "$drop_host" "mkdir -p '$drop_path'" 2>/dev/null
+  send_png && scp -q "$png" "$drop_host:$drop_path/$png_name" 2>/dev/null
+  if ! scp -q "$txt" "$drop_host:$drop_path/$txt_name" 2>/dev/null; then
+    echo "FAILED — could not drop to $drop_host:$drop_path"; exit 0
+  fi
+  src_sha="$(sha256sum "$txt" 2>/dev/null | cut -d' ' -f1)"
+  dst_sha="$(ssh -o BatchMode=yes "$drop_host" \
+      "chmod 600 '$drop_path/$txt_name' '$drop_path/$png_name' 2>/dev/null; \
+       sha256sum '$drop_path/$txt_name' 2>/dev/null || shasum -a 256 '$drop_path/$txt_name' 2>/dev/null" \
+      2>/dev/null | cut -d' ' -f1)"
+  if [ -z "$dst_sha" ] || [ "$src_sha" != "$dst_sha" ]; then
+    echo "FAILED — copied but the far side does not match; do not trust $drop_host:$drop_path/$txt_name"
+    echo "    src=$src_sha"
+    echo "    dst=${dst_sha:-<could not read it back>}"
+    exit 0
+  fi
+  ref="$drop_host:$drop_path/$(ref_base)"
+fi
+
+# 🔴 XCLIP MUST OUTLIVE THIS SCRIPT, AND THAT IS WHY IT MUST BE DETACHED.
+# An X selection is served by the process that owns it, so xclip deliberately stays alive
+# until another application takes the clipboard. It inherited this script's stdout and
+# stderr, so ANY caller reading our output with $(...) waited for xclip to die before it
+# saw a single line -- and ask-pick, which the pill uses, does exactly that.
+#
+# MEASURED: `ask --page` did its whole job in about two seconds and then sat there for
+# 162 SECONDS. I spent three rounds blaming the accessibility layer, which turned out to
+# take 178ms. The work was finished the entire time; only the pipe was still open.
+#
+# setsid + closed fds: the clipboard still works, and the caller is no longer held hostage.
+for c in wl-copy xclip; do
+  command -v $c >/dev/null 2>&1 || continue
+  case "$c" in
+    wl-copy) printf '%s' "$ref" | setsid wl-copy >/dev/null 2>&1 & ;;
+    xclip)   printf '%s' "$ref" | setsid xclip -selection clipboard >/dev/null 2>&1 & ;;
+  esac
+  break
+done
+
+# Shell-quote a string ONCE, safely. Defined HERE, above both of its users -- an earlier edit
+# spliced out the block it used to live in and took this with it, so every $(sq ...) expanded to
+# nothing and the built command came out truncated. (It was then left DEFINED BUT UNCALLED: the
+# command was built with a hand-written \'$prompt\' instead. Both users now go through it.)
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"; }
+
+# ---- DISPATCH PREFLIGHT — decided BEFORE the verdict is printed ----------------------------
+# 🔴 FAILURE CLASS THIS CATCHES (CLAUDE.md Rule 8 clause 5): "the row's ask_cmd does not resolve
+# on ask_host, so the session opens onto `command not found` while ask prints OK and the pill
+# flashes green." NOT the class "the agent gave a bad answer", and NOT "the drop failed" -- those
+# are proven elsewhere.
+#
+# MEASURED 2026-09-07: claude, codex and continue all carried BARE command names, and the PATH a
+# non-interactive `ssh hub "cmd"` gets is
+#   /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+# which contains neither ~/.local/bin nor ~/.npm-global/bin. Three of five routes were dead for a
+# day and every single one of them printed OK. ask-pick:107 matches OK* and fired a green "sent"
+# notification on top of it. That is green-by-construction inside the reporting mechanism -- the
+# same inversion that got ~/ceo-tools/verified_fix.sh suspended fleet-wide.
+#
+# WHY A PREFLIGHT AND NOT A WAIT. The session is spawned DETACHED on purpose (see the comment on
+# the spawn below: a 3-minute capture must not block the panel), so its exit status is genuinely
+# unavailable and no amount of care will make it available. But the F1 class is decidable BEFORE
+# the spawn: ask ask_host whether the command resolves, IN THE SAME NON-INTERACTIVE SHELL the
+# dispatch will use. That is not a proxy for the failing lookup -- it IS the failing lookup.
+# What OK therefore means, exactly, and the line under it says so rather than leaving it implied:
+# "the capture landed, and the command resolves on ask_host." It does not promise an answer.
+DISPATCH_INNER=""; DISPATCH_NOTE=""; DISPATCH_FAIL=""
+if [ "$OPEN" -eq 1 ] && [ -n "$A_ASKCMD" ]; then
+  # THE HALF THAT WAS MISSING. Dropping a file and copying a path is a screenshot tool; this is
+  # what makes it an ASK -- a session actually opens and the agent is already working.
+  #
+  # 🔴 THE COMMAND CARRIES A REFERENCE, NOT THE QUESTION. Embedding the question inline meant
+  # quoting a multi-line string through `ssh -t` through `bash -c`; it produced
+  # $'what\ do\ you...' -- unrunnable, and a fresh bug every time the text changed. The question
+  # is ALREADY in the dropped file next to the OCR and the provenance header, so the agent gets
+  # MORE context by reading it than any argv string could carry.
+  #
+  # 🎯 RULING ON THE HOST-STRIP (reconsidered 2026-09-07, KEPT, and made safe by wiring).
+  # $ref carries a "host:" prefix because the CLIPBOARD reference is written for a human moving
+  # between machines; this command already runs ON that host, so the prefix has to come off. The
+  # alternative that was weighed -- keep the host for rows whose ask_cmd is a BRIDGE to a third
+  # machine, as dreamzs's ~/ceo-tools/dreamzs.sh is -- cannot be implemented honestly here:
+  # `ask` has no way to know a command forwards elsewhere, so it would need a new registry key
+  # ASSERTING it, and a fully-qualified path is useless to an agent that cannot reach other
+  # machines anyway (Dreamzs is sandboxed to three directories on its own box, per
+  # SANDBOX_RULES.md). The invariant that makes the strip harmless is the one now ENFORCED above
+  # and in _regcheck.py: a drop is ABSOLUTE and is the path AS SEEN FROM WHERE THE AGENT READS.
+  # Given that, removing the host cannot change what the path means -- so the reference is built
+  # straight from $drop_path rather than by string-surgery on $ref.
+  #
+  # Always the SIDECAR, never the .png: the question, the OCR and the provenance header live
+  # there, and for a text-only agent it is the entire payload. A vision agent finds the image
+  # path inside it (see the "image:" line, which now names the agent-side path).
+  read_ref="$drop_path/$txt_name"
+  prompt="Read ${read_ref} and answer the question in it."
+  case "$prompt" in *"'"*) DISPATCH_FAIL="the reference contains a single quote: $read_ref" ;; esac
+  cmd="${A_ASKCMD//\{q\}/$(sq "$prompt")}"
+
+  # The executable is the first word of ask_cmd, and _regcheck.py requires it to be an ABSOLUTE
+  # path for exactly this reason -- see F1 above. Probing it needs no expansion and no eval.
+  exe="${A_ASKCMD%% *}"
+  # Same alias-vs-hostname trap as the drop path: Hub's hostname is "hubuser", so
+  # comparing literally against "hub" sent a LOCAL agent through ssh to itself.
+  if [ "$A_ASKHOST" = local ] || [ "$A_ASKHOST" = "$(hostname -s)" ] \
+     || { [ -n "$A_ASKHOST" ] && is_local_host "${A_ASKHOST##*@}"; }; then
+    DISPATCH_INNER="$cmd"
+    probe="$(command -v "$exe" 2>/dev/null || echo __MISSING__)"
+  else
+    DISPATCH_INNER="ssh -t $A_ASKHOST \"$cmd\""
+    # Match the printed WORD, never the exit status: ssh exits with the REMOTE command's status,
+    # so "not found" and "host unreachable" are indistinguishable by $? and mean different things.
+    probe="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$A_ASKHOST" \
+             "command -v '$exe' || echo __MISSING__" 2>/dev/null)"
+  fi
+  if [ -n "$DISPATCH_FAIL" ]; then :
+  elif [ -z "$probe" ]; then
+    DISPATCH_FAIL="cannot reach ${A_ASKHOST} over ssh — the session would open onto a dead hop"
+  elif [ "${probe#*__MISSING__}" != "$probe" ]; then
+    DISPATCH_FAIL="${A_ASKHOST} cannot run ${exe} — not found on that host's non-interactive PATH"
+  else
+    DISPATCH_NOTE="${exe} resolves on ${A_ASKHOST}"
+  fi
+  [ -n "$DISPATCH_FAIL" ] && DISPATCH_INNER=""
+fi
+
+# Publish a one-line status the PILL can read. The pill runs on the GTK main loop at 1 Hz and
+# the framework's rule is absolute -- "No subprocess, no network" -- so it must never call this
+# script to find out what happened. A tiny file read is /proc-speed and safe.
+#
+# 🔴 THE STATUS AND THE PRINTED WORD ARE NOW THE SAME DECISION, TAKEN ONCE. Before 2026-09-07
+# this wrote "ok" and printed OK unconditionally, ABOVE the dispatch block, and never read what
+# the dispatch did -- so a dead route lit the pill green and fired ask-pick's "sent" toast.
+# askpill.py:316 greens on the literal word "ok" and dims on anything else, and ask-pick:110
+# routes any non-OK/REFUSED verdict to its "ask failed" branch, so "failed" needs no change in
+# either file. The vocabulary stays OK / REFUSED / FAILED exactly as this script's header says.
+if [ -n "$DISPATCH_FAIL" ]; then
+  note_status failed
+  echo "FAILED — ${A_LABEL}: ${DISPATCH_FAIL}"
+  echo "     the capture DID land, verified, at ${ref}"
+  echo "     nothing was lost — only the session could not be opened. Fix ask_cmd/ask_host"
+  echo "     for '${AGENT}' in agents.yml, then re-run."
+  exit 0
+fi
+note_status ok
+echo "OK — ${A_LABEL} (${A_MODEL})${hits:+ [FORCED]}"
+echo "     ${ref}"
+echo "     (on clipboard)"
+[ -n "$DISPATCH_NOTE" ] && echo "     dispatch: ${DISPATCH_NOTE}"
+
+if [ -n "$DISPATCH_INNER" ]; then
+  if [ "$DRYOPEN" -eq 1 ]; then
+    # Print the command instead of spawning. Added because "hiding" gnome-terminal from PATH did
+    # not hide it -- /usr/bin was still on the path -- so the test silently opened two real
+    # windows instead of showing what it would run.
+    echo "     DRY-OPEN would run:"; echo "       $DISPATCH_INNER"
+  # 🔴 THE LAST GREEN-BY-CONSTRUCTION RESIDUE IN THIS FILE, AND WHAT IS AND IS NOT CLOSED.
+  # The old code printed "opened a session with X" for a process it had just thrown away the
+  # exit status of. Two different claims were hiding in that one line:
+  #   (a) "a terminal COULD be opened here" -- DECIDABLE, and it was never being asked. With no
+  #       DISPLAY and no WAYLAND_DISPLAY, gnome-terminal dies on "Cannot open display" every
+  #       time, and ask still said it had opened a session. That is now a preflight, below.
+  #   (b) "a window IS now on screen" -- NOT decidable without waiting, and waiting is refused
+  #       on measured grounds, not taste: this same file already lost 162 SECONDS to a detached
+  #       child holding our stdout open (see the xclip note above), and the session being
+  #       spawned is an interactive agent that may run for minutes. A panel that blocks on it
+  #       is a frozen panel, on a laptop that has frozen three times in two days.
+  # So the claim is narrowed to what is true -- the request was made -- and the evidence for
+  # the other half is put somewhere Chris can look: gnome-terminal's own stderr, which the old
+  # line sent to /dev/null. That is the difference between an unverifiable claim and a
+  # verifiable one nobody has verified yet.
+  elif [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    echo "     NOT OPENED — no DISPLAY/WAYLAND_DISPLAY here, so no terminal can be spawned."
+    echo "     Run it yourself: $DISPATCH_INNER"
+  elif command -v gnome-terminal >/dev/null 2>&1; then
+    spawn_log="$HOME/.askbar/spawn.log"
+    # Cap it. An unbounded log in $HOME is its own small bug.
+    [ -f "$spawn_log" ] && [ "$(stat -c%s "$spawn_log" 2>/dev/null || echo 0)" -gt 65536 ] && : > "$spawn_log"
+    printf '\n=== %s  %s ===\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$AGENT" >> "$spawn_log" 2>/dev/null
+    # FLEET-4HY: the window is ask-shell, not a bare `read`. It runs $DISPATCH_INNER EXACTLY as
+    # before, then -- for a registry row marked followup: resume -- offers the next turn of the
+    # same conversation. Native rows (a REPL, or dreamzs --stay) fall through to the old prompt.
+    shell_host=local; [ "${DISPATCH_INNER#ssh -t }" != "$DISPATCH_INNER" ] && shell_host="$A_ASKHOST"
+    setsid gnome-terminal -- "$HERE/ask-shell" "$AGENT" "$shell_host" "$DISPATCH_INNER" >>"$spawn_log" 2>&1 &
+    echo "     session REQUESTED with ${A_LABEL} (detached; its exit status is not waited on)"
+    echo "     no window? $spawn_log — or run: $DISPATCH_INNER"
+  else
+    echo "     (no gnome-terminal; run manually): $DISPATCH_INNER"
+  fi
+fi
+[ "$NEW_SESSION" -eq 1 ] && { echo "     opening a session..."; eval "$A_LAUNCH" ; }

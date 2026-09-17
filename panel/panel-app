@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+# ============================================================================
+#  panel-app - add, remove and reorder launchers on EITHER Cinnamon bar.
+#
+#  Why this exists: the two bars are different applets with different data
+#  models, which is why the GUI can only edit one of them.
+#
+#    bottom panel = grouped-window-list@cinnamon.org  -> key "pinned-apps"
+#    left panel   = panel-launchers@cinnamon.org      -> key "launcherList"
+#
+#  The menu's "Add to panel" only knows how to pin into grouped-window-list,
+#  so it never offers the left bar, and a pinned app cannot be dragged across
+#  because the other applet stores a different thing. Hence one tool that
+#  speaks both.
+#
+#  What makes an edit look inert, MEASURED on Cinnamon 6.6.9:
+#    * ReloadXlet replies normally and does NOT re-read the list.
+#    * Even restartCinnamon() did not pick a new entry up reliably - the live
+#      applet was still holding six launchers while the JSON on disk had seven.
+#  The applet caches its list in memory and silently drops nothing: _reload()
+#  just iterates whatever IT thinks the list is.
+#
+#  So the write is only half the job. The other half is pushing the new list
+#  into the LIVE applet object over Cinnamon's own Eval dbus method and calling
+#  its reload. That applies instantly with NO Cinnamon restart. Verified: a
+#  seventh launcher appeared within two seconds, "7 launchers, 7 rendered".
+#
+#  Runs as chris. No root, ever.
+# ============================================================================
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+SPICES = os.path.expanduser("~/.config/cinnamon/spices")
+BARS = {
+    "bottom": ("grouped-window-list@cinnamon.org", "pinned-apps"),
+    "left": ("panel-launchers@cinnamon.org", "launcherList"),
+}
+APPDIRS = ["/usr/share/applications",
+           os.path.expanduser("~/.local/share/applications"),
+           "/var/lib/flatpak/exports/share/applications",
+           os.path.expanduser("~/.local/share/flatpak/exports/share/applications")]
+
+
+def sh(*a):
+    return subprocess.run(a, capture_output=True, text=True).stdout.strip()
+
+
+def enabled_applets():
+    raw = sh("gsettings", "get", "org.cinnamon", "enabled-applets")
+    return [x.strip().strip("'") for x in raw.strip("[]").split(",")]
+
+
+def resolve_bar(name):
+    """-> (uuid, key, json_path, panel). Located from enabled-applets so this
+    keeps working if the applet instance id ever changes."""
+    if name not in BARS:
+        die(f"unknown bar {name!r} - use one of: {', '.join(BARS)}")
+    uuid, key = BARS[name]
+    for entry in enabled_applets():
+        parts = entry.split(":")
+        if len(parts) == 5 and parts[3] == uuid:
+            path = f"{SPICES}/{uuid}/{parts[4]}.json"
+            if not os.path.exists(path):
+                die(f"{name}: applet is enabled but {path} does not exist")
+            return uuid, key, path, parts[0]
+    die(f"no {uuid} applet is on any panel - `panel-app bars` to see what is")
+
+
+def load(path, key):
+    with open(path) as f:
+        doc = json.load(f)
+    if key not in doc:
+        die(f"{path} has no {key!r} key")
+    return doc, list(doc[key].get("value") or [])
+
+
+def save(path, key, doc, items, uuid):
+    doc[key]["value"] = items
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    shutil.copy2(path, f"{path}.{stamp}.bak")   # timestamped: parallel sessions
+    tmp = path + ".new"                          # must not clobber each other
+    with open(tmp, "w") as f:
+        json.dump(doc, f, indent=4)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def cinnamon_eval(js):
+    r = subprocess.run(["dbus-send", "--session", "--print-reply",
+                        "--dest=org.Cinnamon", "/org/Cinnamon",
+                        "org.Cinnamon.Eval", f"string:{js}"],
+                       capture_output=True, text=True)
+    return r.stdout.strip().splitlines()[-1].strip() if r.stdout.strip() else ""
+
+
+def live_apply(bar, items):
+    """Push the list into the running applet and reload it. Returns a status
+    string, or None if the applet could not be reached."""
+    payload = json.dumps(items)
+    if bar == "left":
+        body = (f"d.applet.launcherList = {payload}; d.applet._reload();"
+                " return 'ok '+d.applet._launchers.length+' rendered';")
+        needle = "panel-launchers"
+    else:
+        # PinnedFavs.onFavoritesChange() is the applet's own path: it reloads
+        # the favourites from settings and refreshes every workspace. Setting
+        # pinnedApps alone does nothing - the favourites list is a separate
+        # object that re-reads settings in its reload().
+        body = (f"d.applet.settings.setValue('pinned-apps', {payload});"
+                " d.applet.pinnedFavorites.onFavoritesChange();"
+                " return 'ok '+d.applet.pinnedFavorites._favorites.length+' pinned';")
+        needle = "grouped-window-list"
+    js = ("(function(){let am=imports.ui.appletManager;"
+          "for (let d of am.definitions){"
+          f"if(d.uuid && d.uuid.indexOf('{needle}')>=0 && d.applet){{{body}}}}}"
+          "return 'applet not reachable';})()")
+    out = cinnamon_eval(js)
+    if not out or "not reachable" in out or "stack" in out:
+        return None
+    return out
+
+
+def nudge(bar, items):
+    if live_apply(bar, items) is None:
+        print("   the live applet could not be reached - run:  panel-app apply")
+
+
+def restart_shell():
+    subprocess.run(["dbus-send", "--session", "--dest=org.Cinnamon", "/org/Cinnamon",
+                    "org.Cinnamon.Eval",
+                    "string:imports.ui.main.restartCinnamon(true);"],
+                   capture_output=True)
+
+
+def find_desktop(term):
+    """Accept a full path, a basename, or a fuzzy name match."""
+    if term.endswith(".desktop") and os.path.exists(term):
+        return os.path.basename(term)
+    cands = []
+    for d in APPDIRS:
+        for p in glob.glob(os.path.join(d, "*.desktop")):
+            base = os.path.basename(p)
+            if base == term or base == term + ".desktop":
+                return base
+            name = ""
+            try:
+                for ln in open(p, errors="ignore"):
+                    if ln.startswith("Name="):
+                        name = ln[5:].strip()
+                        break
+            except Exception:
+                pass
+            if term.lower() in base.lower() or term.lower() in name.lower():
+                cands.append((base, name))
+    if not cands:
+        die(f"no .desktop matches {term!r} - try: panel-app search {term}")
+    if len(cands) > 1:
+        exact = [c for c in cands if c[0].lower().startswith(term.lower())]
+        if len(exact) == 1:
+            return exact[0][0]
+        print(f"{term!r} is ambiguous:", file=sys.stderr)
+        for b, n in sorted(cands)[:12]:
+            print(f"   {b:<45} {n}", file=sys.stderr)
+        sys.exit(1)
+    return cands[0][0]
+
+
+def pretty(base):
+    for d in APPDIRS:
+        p = os.path.join(d, base)
+        if os.path.exists(p):
+            for ln in open(p, errors="ignore"):
+                if ln.startswith("Name="):
+                    return ln[5:].strip()
+    return ""
+
+
+def die(msg):
+    print(f"panel-app: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_bars():
+    for entry in enabled_applets():
+        parts = entry.split(":")
+        if len(parts) == 5:
+            for name, (uuid, _) in BARS.items():
+                if parts[3] == uuid:
+                    print(f"  {name:<7} {parts[0]} {parts[1]}  {uuid}  instance {parts[4]}")
+
+
+def cmd_list(bar):
+    uuid, key, path, panel = resolve_bar(bar)
+    _, items = load(path, key)
+    print(f"{bar} bar ({panel}, {uuid}) - {len(items)} entries")
+    for i, it in enumerate(items):
+        missing = "" if any(os.path.exists(os.path.join(d, it)) for d in APPDIRS) else "  <- MISSING .desktop"
+        print(f"  {i:2d}  {it:<48} {pretty(it)}{missing}")
+
+
+def cmd_add(bar, term, at=None):
+    uuid, key, path, _ = resolve_bar(bar)
+    doc, items = load(path, key)
+    base = find_desktop(term)
+    if base in items:
+        die(f"{base} is already on the {bar} bar (index {items.index(base)})")
+    items.insert(len(items) if at is None else int(at), base)
+    save(path, key, doc, items, uuid)
+    print(f"added {base} to the {bar} bar")
+    nudge(bar, items)
+
+
+def cmd_remove(bar, term):
+    uuid, key, path, _ = resolve_bar(bar)
+    doc, items = load(path, key)
+    if term.isdigit() and int(term) < len(items):
+        base = items[int(term)]
+    else:
+        base = next((i for i in items if i == term or i == term + ".desktop"
+                     or term.lower() in i.lower()), None)
+        if base is None:
+            die(f"{term!r} is not on the {bar} bar")
+    items.remove(base)
+    save(path, key, doc, items, uuid)
+    print(f"removed {base} from the {bar} bar")
+    nudge(bar, items)
+
+
+def cmd_move(bar, frm, to):
+    uuid, key, path, _ = resolve_bar(bar)
+    doc, items = load(path, key)
+    frm, to = int(frm), int(to)
+    if not (0 <= frm < len(items)) or not (0 <= to < len(items)):
+        die(f"index out of range - the {bar} bar has {len(items)} entries")
+    items.insert(to, items.pop(frm))
+    save(path, key, doc, items, uuid)
+    print(f"moved {items[to]} to position {to}")
+    nudge(bar, items)
+
+
+def cmd_copy(term, src, dst):
+    """The thing the GUI cannot do: put the same app on the other bar."""
+    _, skey, spath, _ = resolve_bar(src)
+    _, sitems = load(spath, skey)
+    base = next((i for i in sitems if term.lower() in i.lower()), None) or find_desktop(term)
+    cmd_add(dst, base)
+
+
+def cmd_search(term):
+    seen = set()
+    for d in APPDIRS:
+        for p in sorted(glob.glob(os.path.join(d, "*.desktop"))):
+            base = os.path.basename(p)
+            if base in seen:
+                continue
+            name = pretty(base)
+            if term.lower() in base.lower() or term.lower() in name.lower():
+                seen.add(base)
+                print(f"  {base:<48} {name}")
+    if not seen:
+        print(f"  nothing matches {term!r}")
+
+
+USAGE = """panel-app - edit either Cinnamon bar's launchers
+
+  panel-app bars                       which bars exist and where
+  panel-app list <bottom|left>         what is on a bar, with indices
+  panel-app search <term>              find an app's .desktop name
+
+  panel-app add <bar> <app> [index]    add an app  (name, basename or path)
+  panel-app remove <bar> <app|index>   take one off
+  panel-app move <bar> <from> <to>     reorder within a bar
+  panel-app copy <app> <src> <dst>     put an app on the OTHER bar
+
+  panel-app apply                      last resort: restart Cinnamon (only
+                                       needed after a .desktop Icon= change)
+  panel-app edit-mode on|off           drag applets BETWEEN panels in the GUI
+
+Every write applies to the running panel immediately and leaves a timestamped
+.bak. No Cinnamon restart: the list is pushed into the live applet, because on
+6.6.9 neither ReloadXlet nor a restart reliably re-reads it from disk."""
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(USAGE)
+        return 0
+    c = argv[1]
+    try:
+        if c == "bars":
+            cmd_bars()
+        elif c == "list":
+            cmd_list(argv[2] if len(argv) > 2 else "left")
+        elif c == "search":
+            cmd_search(argv[2])
+        elif c == "add":
+            cmd_add(argv[2], argv[3], argv[4] if len(argv) > 4 else None)
+        elif c == "remove":
+            cmd_remove(argv[2], argv[3])
+        elif c == "move":
+            cmd_move(argv[2], argv[3], argv[4])
+        elif c == "copy":
+            cmd_copy(argv[2], argv[3], argv[4])
+        elif c == "edit-mode":
+            val = "true" if argv[2] == "on" else "false"
+            subprocess.run(["gsettings", "set", "org.cinnamon", "panel-edit-mode", val])
+            print(f"panel edit mode {argv[2]} - "
+                  + ("now drag applets between panels, then turn it off again"
+                     if val == "true" else "back to normal"))
+        elif c in ("apply", "restart-shell"):
+            restart_shell()
+            print("Cinnamon restarting - your edits appear in a few seconds "
+                  "(open windows are not affected)")
+        else:
+            print(USAGE)
+            return 1
+    except IndexError:
+        print(USAGE)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

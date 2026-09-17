@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# mrog-sandbox — run the notch panel inside a NESTED X server, so testing it cannot
+# freeze the real desktop.
+#
+# WHY THIS EXISTS. Testing a pill by launching it on :0 means an input-shape bug or a
+# stuck grab takes the whole desktop with it -- twice now. Xephyr gives the panel its own
+# X server on :9. A pointer or keyboard grab taken there is scoped to THAT server: the
+# real :0 never sees it. Worst case the nested window stops responding and you close it.
+#
+# It also removes the reason agents restart the real panel at all, which is the freeze
+# Chris has been eating.
+#
+# 🎯 STOP KILLS ONLY PIDS THIS SCRIPT RECORDED. No pkill by pattern -- a broad pattern
+# kill is how the wrong compositor gets shot.
+#
+# usage: mrog-sandbox start [WxH]   nested X + the panel inside it
+#        mrog-sandbox shot FILE     PNG of the nested screen
+#        mrog-sandbox click X Y     click inside the sandbox
+#        mrog-sandbox status
+#        mrog-sandbox stop
+set -uo pipefail
+D=":9"
+RUN="$HOME/.mrog-sandbox"
+mkdir -p "$RUN"
+XPID="$RUN/xephyr.pid"; NPID="$RUN/notch.pid"; LOG="$RUN/notch.log"
+
+alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+
+case "${1:-status}" in
+start)
+  geom="${2:-1600x1000}"
+  if alive "$(cat "$XPID" 2>/dev/null)"; then echo "  already running (Xephyr $(cat "$XPID"))"; exit 0; fi
+  DISPLAY=:0 setsid nohup Xephyr $D -screen "$geom" -title "mrog SANDBOX $D — safe to close" \
+      -resizeable >"$RUN/xephyr.log" 2>&1 </dev/null &
+  echo $! > "$XPID"
+  for i in $(seq 1 40); do DISPLAY=$D xdotool getdisplaygeometry >/dev/null 2>&1 && break; sleep 0.25; done
+  DISPLAY=$D xdotool getdisplaygeometry >/dev/null 2>&1 || { echo "  FAILED: Xephyr never answered on $D"; exit 1; }
+  echo "  Xephyr up on $D ($geom), pid $(cat "$XPID")"
+
+  # The panel needs SOME window manager or its DOCK windows never map. metacity is already
+  # installed (it is Cinnamon's own fallback) and is confined to :9 here.
+  if command -v metacity >/dev/null 2>&1; then
+    DISPLAY=$D setsid nohup metacity >"$RUN/wm.log" 2>&1 </dev/null & echo $! > "$RUN/wm.pid"
+    sleep 1; echo "  window manager up inside the sandbox"
+  fi
+
+  DISPLAY=$D XDG_RUNTIME_DIR="/run/user/$(id -u)" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus" \
+    setsid nohup "$HOME/.local/bin/mrog-notch" >"$LOG" 2>&1 </dev/null &
+  echo $! > "$NPID"
+  sleep 4
+  if alive "$(cat "$NPID")"; then
+    echo "  panel running inside the sandbox, pid $(cat "$NPID")"
+  else
+    echo "  PANEL DIED — first error:"; grep -iE "traceback|error|exception" -A4 "$LOG" | head -20 | sed 's/^/    /'
+  fi
+  echo "  windows on $D: $(DISPLAY=$D timeout 5 wmctrl -l 2>/dev/null | wc -l)"
+  ;;
+shot)
+  out="${2:-$RUN/shot.png}"
+  ffmpeg -loglevel error -y -f x11grab -video_size "$(DISPLAY=$D xdotool getdisplaygeometry 2>/dev/null | tr ' ' 'x')" \
+         -i $D -frames:v 1 "$out" 2>&1 | sed 's/^/  /'
+  [ -s "$out" ] && echo "  $out  ($(stat -c %s "$out") bytes)" || echo "  FAILED: no image"
+  ;;
+click)
+  DISPLAY=$D xdotool mousemove "${2:?x}" "${3:?y}" click 1 && echo "  clicked $2,$3 inside $D"
+  ;;
+key)
+  DISPLAY=$D xdotool key "${2:?key}" && echo "  sent $2 inside $D"
+  ;;
+type)
+  shift; DISPLAY=$D xdotool type --delay 30 "$*" && echo "  typed inside $D"
+  ;;
+status)
+  printf "  Xephyr : %s\n" "$(alive "$(cat "$XPID" 2>/dev/null)" && echo "running pid $(cat "$XPID")" || echo stopped)"
+  printf "  panel  : %s\n" "$(alive "$(cat "$NPID" 2>/dev/null)" && echo "running pid $(cat "$NPID")" || echo stopped)"
+  DISPLAY=$D timeout 5 wmctrl -l 2>/dev/null | sed 's/^/    /'
+  ;;
+stop)
+  for f in "$NPID" "$RUN/wm.pid" "$XPID"; do
+    p="$(cat "$f" 2>/dev/null)"
+    if alive "$p"; then kill -TERM "$p" 2>/dev/null; sleep 1; alive "$p" && kill -KILL "$p" 2>/dev/null; echo "  stopped pid $p ($(basename "$f" .pid))"; fi
+    rm -f "$f"
+  done
+  echo "  sandbox down. The real desktop was never involved."
+  ;;
+log) tail -40 "$LOG" 2>&1 | sed 's/^/  /' ;;
+*) sed -n '2,20p' "$0" ;;
+esac

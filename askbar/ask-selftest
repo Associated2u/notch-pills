@@ -1,0 +1,852 @@
+#!/usr/bin/env python3
+# ask-selftest — LAYER 0 of the Ask Bar: the thing that notices when a route dies.
+#
+# WHY THIS EXISTS, IN ONE SENTENCE: on 2026-09-06 three of five routes were dead for a whole
+# day while the pill flashed green, because the only check anyone ran was "did ask print OK",
+# and ask printed OK before it knew anything. A one-time check is what already failed here.
+#
+# 🔴 VERDICTS ARE PRINTED WORDS: PASS / FAIL / SKIP / ERROR. NEVER AN EXIT CODE.
+#   This fleet has been bitten six times by exit-code-as-verdict, most recently
+#   freeze_table.sh --check, whose codes are INVERTED (FROZEN=0, CLEAR=1). This script
+#   always exits 0. The last line is always:  SELFTEST VERDICT: <WORD>
+#   A scheduler that needs an exit status must derive it from that WORD, in exactly one
+#   visible place -- see ask-selftest-cron, which is the only thing allowed to do that.
+#
+# 🔴 THE TWO FAILURE CLASSES IT COVERS, STATED SEPARATELY BECAUSE COLLAPSING THEM IS HOW
+#    THE 2026-09-06 OUTAGE HID (CLAUDE.md Rule 8 clause 5):
+#
+#   CLASS A — "CAN THE COMMAND RUN?"  (this is F1, and it is what killed claude/codex/continue)
+#       A1 shape       the row's own values are honourable: drop is HOST:/absolute, ask_cmd
+#                      carries {q} and starts with an absolute path, vision is a real bool.
+#       A2 drop-reach  the drop host answers, and the drop directory exists and is writable
+#                      by the account `ask` copies as.
+#       A3 cmd-resolve the ask_cmd executable is found on ask_host IN THE SAME NON-INTERACTIVE
+#                      SHELL the dispatch uses. This is not a proxy for the failing lookup --
+#                      it IS the failing lookup.
+#       A5 drop-agentside  THE DROP HOST IS THE MACHINE THE AGENT READS ON, and that account
+#                      can actually read the directory. A2 asks whether the file can LAND;
+#                      this asks whether the reader is standing in the same place. They came
+#                      apart on 2026-09-07: dreamzs dropped on Hub and read on GpuBox,
+#                      every CLASS A check passed, and only an LLM call could see it. The
+#                      registry now carries `agent_ssh` so this is decidable for free.
+#       A4 cmd-health  the program actually STARTS and its credential is present. A3 alone is
+#                      NOT this: `codex --version` exits 0 while `codex exec` dies on its own
+#                      config, and `cn --version` exits 0 while cn is not logged in. Stage 1
+#                      accepted `--version` as proof a route worked and Stage 2 refuted it.
+#                      The probe comes from the ROW (`health:`), so a new agent brings its own.
+#
+#   CLASS B — "DID THE AGENT READ THE FILE?"  (this is F2/F3, and it is a DIFFERENT failure)
+#       B1 round-trip  drop a file containing a token that exists NOWHERE ELSE plus two numbers
+#                      to add, hand the agent only the PATH, and require both the token and the
+#                      computed sum back. A polite answer, a bluff, or an agent that guessed a
+#                      different path all fail this. Only --full runs it; it costs LLM calls.
+#
+#       B2 path-fidelity  DID IT READ *THE PATH WE NAMED*, or did it find the file some other
+#                      way? The token alone cannot tell those apart -- dreamzs "worked" once by
+#                      SEARCHING after the relative path it was handed did not resolve, and that
+#                      recovery is what hid the bug. So two DECOY files, carrying different
+#                      tokens and landing NEWER, are placed in the same drop directory and are
+#                      never mentioned to the agent. An answer containing decoy content is proof
+#                      the agent read a file it was never given the path to. Same LLM call as B1;
+#                      the assertion is free.
+#
+#   🔴 A FOURTH VERDICT WORD: BLOCKED. A route waiting on a HUMAN is not a broken route, and
+#   reporting both as FAIL is how a real breakage hides inside a known backlog -- three of five
+#   routes are currently waiting on Chris. A probe declares `blocked_on:` WITH a `blocked_since:`
+#   date; past its grace period (default 14 days) BLOCKED escalates back to FAIL on its own, so
+#   the state can never quietly become permanent. BLOCKED does not raise the critical alert;
+#   everything that is not PASS or BLOCKED does.
+#
+#   NOT covered, deliberately: "the agent gave a GOOD answer". Unprovable here, and pretending
+#   otherwise is how a checker starts lying.
+#
+# 🔴 FAIL CLOSED. An unreachable host, a probe that times out, a registry that will not parse:
+#   FAIL or ERROR, never PASS. Silence is never evidence of health.
+#
+# 🔴 IT READS THE REGISTRY. Adding a row to agents.yml puts that row under test with no edit to
+#   this file -- the principle already stated at the top of agents.yml. A row that brings no
+#   `health:` probe gets SKIP on A4 and its ROUTE verdict degrades to SKIP, so a new agent can
+#   never inherit a green light it has not earned.
+#
+# 🔴 IT NEVER TOUCHES DISPLAY :0 AND NEVER TOUCHES THE CLIPBOARD.
+#   - It never runs a capture tool: the round trip uses `ask --none`, which grabs nothing.
+#   - It never spawns a terminal: it uses `ask --dry-open` and runs the printed command itself.
+#   - It unsets DISPLAY and WAYLAND_DISPLAY for the `ask` child, so ask's xclip/wl-copy branch
+#     finds no display and exits instantly, leaving Chris's clipboard alone. (Measured
+#     2026-09-07: a stray detached xclip from an earlier test owned his clipboard for an hour.)
+#
+# usage:
+#   ask-selftest                     cheap (default): CLASS A only. No LLM spend. Safe to cron.
+#   ask-selftest --full              CLASS A + CLASS B. Spends LLM calls. Skips `paid: true`
+#                                    rows unless --paid is given too.
+#   ask-selftest --full --paid       ...including metered rows (hermes bills a real account).
+#   ask-selftest --only claude,codex  limit to these ids      --skip hermes   exclude these ids
+#   ask-selftest --registry PATH     test a fixture instead of the live registry
+#   ask-selftest --quiet             summary + verdict only
+import argparse, calendar, datetime, getpass, os, random, re, shutil, socket, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_REG = os.environ.get("ASKBAR_REGISTRY", os.path.join(HERE, "agents.yml"))
+
+PASS, FAIL, SKIP, ERROR, BLOCKED = "PASS", "FAIL", "SKIP", "ERROR", "BLOCKED"
+# Worst-wins, ONE order used everywhere -- per check, per route, and for the overall verdict.
+# BLOCKED sits ABOVE PASS (it is not health) and BELOW SKIP, deliberately: a SKIP means some
+# route is NOT BEING CHECKED, which is the condition that let three routes stay dead for a day,
+# and it must never be masked by a route that is merely waiting on a human.
+RANK = {PASS: 0, BLOCKED: 1, SKIP: 2, FAIL: 3, ERROR: 4}
+DEFAULT_GRACE_DAYS = 14
+
+SSH_BASE = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            "-o", "StrictHostKeyChecking=accept-new"]
+
+
+DEFAULT_AGENT_TIMEOUT = 240
+
+
+def run(argv, timeout):
+    """Run argv, return (status_word, combined_output). status_word is TIMEOUT/RAN/NOEXEC.
+    The RETURN CODE IS DELIBERATELY NOT RETURNED: every verdict in this file is decided by
+    matching printed text, per the fleet rule that exit codes lie (ssh exits with the REMOTE
+    command's status, so 'not found' and 'host down' are indistinguishable by $?)."""
+    try:
+        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           stdin=subprocess.DEVNULL, timeout=timeout)
+        return "RAN", p.stdout.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired as e:
+        got = (e.stdout or b"").decode("utf-8", "replace")
+        return "TIMEOUT", got
+    except OSError as e:
+        return "NOEXEC", str(e)
+
+
+def local_ips():
+    _, out = run(["ip", "-4", "-o", "addr", "show"], 10)
+    return {ln.split()[3].split("/")[0] for ln in out.splitlines() if len(ln.split()) > 3}
+
+
+def ssh_resolved_host(alias):
+    """A registry host is an SSH ALIAS ('hub'), which DNS cannot resolve -- it exists only
+    in ~/.ssh/config. `ssh -G` reads that same config and prints the real hostname without
+    connecting. Ported from ask's is_local_host() so the two agree about which leg is under
+    test; a checker that disagrees with the program tests a leg the program never uses."""
+    _, out = run(["ssh", "-G", alias], 10)
+    for ln in out.splitlines():
+        if ln.startswith("hostname "):
+            return ln.split(None, 1)[1].strip()
+    return ""
+
+
+_LOCAL_CACHE = {}
+
+
+def is_local_host(h):
+    h = h.split("@")[-1]
+    if h in _LOCAL_CACHE:
+        return _LOCAL_CACHE[h]
+    ans = False
+    if h in ("local", "localhost"):
+        ans = True
+    else:
+        hn = socket.gethostname()
+        if h == hn or h == hn.split(".")[0]:
+            ans = True
+        else:
+            mine = local_ips()
+            for name in {h, ssh_resolved_host(h)}:
+                if not name:
+                    continue
+                try:
+                    addrs = {a[4][0] for a in socket.getaddrinfo(name, None, socket.AF_INET)}
+                except OSError:
+                    addrs = set()
+                if name in mine:
+                    addrs.add(name)
+                if addrs & mine:
+                    ans = True
+                    break
+    _LOCAL_CACHE[h] = ans
+    return ans
+
+
+def on_host(host, cmd, timeout):
+    """Run one shell command where the route would run it. Remote goes through the SAME
+    non-interactive `ssh host "cmd"` shape ask builds -- that shape's thin PATH is the whole
+    of F1, so testing any other shape would test a machine that is not the one in play."""
+    if is_local_host(host):
+        return run(["bash", "-c", cmd], timeout)
+    return run(SSH_BASE + [host, cmd], timeout)
+
+
+class Check(object):
+    def __init__(self, name, verdict, detail):
+        self.name, self.verdict, self.detail = name, verdict, detail
+
+
+def check_shape(row):
+    """A1. The same invariants _regcheck.py enforces file-wide, asserted for THIS row so the
+    per-route line says which row is malformed rather than only that the file is."""
+    bad = []
+    drop = row.get("drop")
+    if not isinstance(drop, str) or ":" not in drop:
+        bad.append("drop has no HOST: prefix")
+    else:
+        path = drop.split(":", 1)[1]
+        if not path.startswith("/"):
+            bad.append("drop path %r is not absolute (it would resolve against the agent's cwd)" % path)
+    cmd = row.get("ask_cmd")
+    if not isinstance(cmd, str) or not cmd.strip():
+        bad.append("ask_cmd is empty")
+    else:
+        if "{q}" not in cmd:
+            bad.append("ask_cmd has no {q} placeholder")
+        first = cmd.split(" ", 1)[0]
+        if not first.startswith("/"):
+            bad.append("ask_cmd starts with %r, a bare name -- not on the non-interactive PATH" % first)
+    v = row.get("vision")
+    if not isinstance(v, bool):
+        # 🔴 WORDING CORRECTED 2026-09-07 (stage 4). This used to say a quoted "false" "reads as
+        # TRUE and ships a .png". That was true of the ask of that morning and is NOT true now:
+        # _reg.py coerces to a canonical bool and fails closed, so a quoted value means NO image
+        # whichever way it is spelled. Leaving the old sentence here would have been a warning
+        # that outlived its defect -- the exact hazard CLAUDE.md Rule 4 records, where a stale
+        # note about a repaired instrument made a later session build duplicate machinery.
+        bad.append("vision is %s %r, not a YAML bool. It now fails CLOSED (no image, whichever "
+                   "way it is spelled) and ask says so out loud, but the row is still lying "
+                   "about the agent's capability and the next reader will trust it"
+                   % (type(v).__name__, v))
+    a_ssh = row.get("agent_ssh")
+    if not isinstance(a_ssh, str) or "@" not in a_ssh or not a_ssh.split("@")[-1].strip():
+        bad.append("agent_ssh %r is not USER@HOST -- without it there is no way to ask whether "
+                   "the drop lands on the machine the agent reads on, which is the whole of the "
+                   "2026-09-07 F2 bug" % a_ssh)
+    if isinstance(drop, str) and "'" in drop:
+        bad.append("drop contains a single quote; it is interpolated into a remote shell command")
+    if bad:
+        return Check("shape", FAIL, "; ".join(bad))
+    return Check("shape", PASS, "drop %s absolute, ask_cmd absolute + {q}, vision is a bool, "
+                                "agent_ssh %s" % (drop, a_ssh))
+
+
+def check_drop(row, timeout):
+    """A2. The drop is where the question physically lands. Unreachable host = FAIL, not a
+    shrug: the capture would be lost and ask would have nothing to hand over."""
+    drop = row.get("drop") or ""
+    if ":" not in drop:
+        return Check("drop-reach", FAIL, "unparseable drop %r" % drop)
+    host, path = drop.split(":", 1)
+    probe = ('if [ -d "%s" ] && [ -w "%s" ]; then echo DROP_DIR_WRITABLE; '
+             'elif [ -d "%s" ]; then echo DROP_DIR_READONLY; '
+             'else echo DROP_DIR_MISSING; fi' % (path, path, path))
+    st, out = on_host(host, probe, timeout)
+    if st == "TIMEOUT":
+        return Check("drop-reach", FAIL, "%s did not answer within %ss -- fail closed" % (host, timeout))
+    if "DROP_DIR_WRITABLE" in out:
+        return Check("drop-reach", PASS, "%s:%s exists and is writable by the account ask copies as" % (host, path))
+    if "DROP_DIR_READONLY" in out:
+        return Check("drop-reach", FAIL, "%s:%s exists but is NOT writable -- the drop would be refused" % (host, path))
+    if "DROP_DIR_MISSING" in out:
+        return Check("drop-reach", FAIL, "%s:%s does not exist" % (host, path))
+    return Check("drop-reach", FAIL, "cannot reach %s (no probe word came back): %s"
+                 % (host, " ".join(out.split())[:160] or "<no output>"))
+
+
+def check_resolve(row, timeout):
+    """A3. Exactly ask's dispatch preflight: does the executable resolve on ask_host, in the
+    shell the dispatch uses. Matching __MISSING__ rather than $? is deliberate -- ssh returns
+    the REMOTE status, so a dead hop and a missing binary are the same number."""
+    host = row.get("ask_host") or "local"
+    cmd = row.get("ask_cmd") or ""
+    exe = cmd.split(" ", 1)[0]
+    if not exe:
+        return Check("cmd-resolve", FAIL, "ask_cmd is empty; there is nothing to resolve")
+    # 🔴 BOTH OUTCOMES ARE POSITIVE WORDS, AND SILENCE IS THE THIRD. Caught by the deadhop
+    # fixture 2026-09-07, in this file: the first version asked `command -v EXE || echo
+    # __MISSING__` and treated "no __MISSING__" as success. Against an unreachable host that is
+    # exactly what comes back -- ssh's own "connect to host 10.255.255.1 port 22: Connection
+    # timed out" on stderr, which this function merges into stdout -- so a black hole read
+    # cmd-resolve PASS. `ask` gets away with the same shape only because it discards stderr and
+    # tests for an EMPTY string; relying on emptiness is one redirection away from breaking.
+    # Requiring __FOUND__ cannot be satisfied by an error message, so it fails closed by
+    # construction rather than by care.
+    st, out = on_host(host, "command -v '%s' >/dev/null 2>&1 && echo __FOUND__ || echo __MISSING__" % exe, timeout)
+    if st == "TIMEOUT":
+        return Check("cmd-resolve", FAIL, "%s did not answer within %ss -- the session would open onto a dead hop" % (host, timeout))
+    if "__FOUND__" in out:
+        return Check("cmd-resolve", PASS, "%s resolves on %s" % (exe, host))
+    if "__MISSING__" in out:
+        return Check("cmd-resolve", FAIL, "%s cannot run %s -- not found on that host's non-interactive PATH" % (host, exe))
+    return Check("cmd-resolve", FAIL, "cannot reach %s -- no verdict word came back, so the session "
+                 "would open onto a dead hop: %s" % (host, " ".join(out.split())[:140] or "<no output>"))
+
+
+def _addrs(name):
+    """Every IPv4 address a host name / ssh alias resolves to, so two spellings of one machine
+    compare equal. `gpu-box` and `gpuuser@192.0.2.82` are the same box; string equality
+    says they are not, and that mistake is exactly what the registry could not previously see."""
+    name = name.split("@")[-1]
+    out = set()
+    for n in {name, ssh_resolved_host(name)}:
+        if not n:
+            continue
+        try:
+            out |= {a[4][0] for a in socket.getaddrinfo(n, None, socket.AF_INET)}
+        except OSError:
+            pass
+    if is_local_host(name):
+        out |= local_ips()
+    return out
+
+
+def _as_agent(a_ssh, cmd, timeout):
+    """Run a command AS THE AGENT'S ACCOUNT, on the agent's machine.
+
+    🔴 CAUGHT BY ITS OWN HEALTHY-CONTROL FIXTURE, 2026-09-07, minutes after this check was
+    written: the first version always went through ssh, so when the agent host was THIS machine
+    it tried to ssh the laptop to itself and got `Permission denied (publickey)` -- a FAIL that
+    said "the agent cannot read the drop" when the truth was "I cannot log in to myself". A
+    check that fails closed for the wrong reason is still a check that lies.
+    But going local whenever the HOST matches is also wrong, and wrong in the more dangerous
+    direction: `agent_ssh` names a USER as well as a host, and on the Mini the writer is
+    the box owner while the reader is the agent account. Running as ourselves there would
+    measure the wrong account and report a read the agent does not have. So: local only when the
+    host is this machine AND the account is this account; ssh otherwise, even to localhost."""
+    user, _, host = a_ssh.partition("@")
+    if host and is_local_host(host) and user == getpass.getuser():
+        return run(["bash", "-c", cmd], timeout)
+    return run(SSH_BASE + [a_ssh, cmd], timeout)
+
+
+def check_agentside(row, timeout):
+    """A5. TWO CLAIMS, BOTH MEASURED, NEITHER PREVIOUSLY ASKED.
+
+    (i) the drop host and `agent_ssh` are THE SAME MACHINE. On 2026-09-07 a bridged row dropped
+        on the bridge host while the agent ran on another box; shape, drop-reach, cmd-resolve and
+        cmd-health all said PASS, because every one of them was asking about a different box
+        than the one holding the reader. Only an LLM round trip could see it. This sees it free.
+    (ii) that account can actually READ the drop. Permissions and ACLs are not the same question
+        as "is the directory writable by the account ask copies as" -- the Hermes spine inbox is
+        the case in point: the box owner writes it, the agent account reads it, and the read is
+        granted by an ACL rather than by the POSIX bits."""
+    drop = row.get("drop") or ""
+    a_ssh = row.get("agent_ssh") or ""
+    if ":" not in drop or "@" not in a_ssh:
+        return Check("drop-agentside", FAIL, "unusable drop %r / agent_ssh %r" % (drop, a_ssh))
+    dhost, path = drop.split(":", 1)
+    da, aa = _addrs(dhost), _addrs(a_ssh)
+    if not da or not aa:
+        return Check("drop-agentside", FAIL,
+                     "cannot resolve %s (%s) or %s (%s) to an address -- fail closed rather than "
+                     "assume they are the same machine" % (dhost, sorted(da), a_ssh, sorted(aa)))
+    if not (da & aa):
+        return Check("drop-agentside", FAIL,
+                     "THE FILE LANDS ON A DIFFERENT MACHINE THAN THE AGENT READS ON: drop host %s "
+                     "%s vs agent %s %s. This is the 2026-09-07 F2 bug exactly; every other CLASS "
+                     "A check can pass while it is true." % (dhost, sorted(da), a_ssh, sorted(aa)))
+    probe = ("if [ ! -d '%s' ]; then echo AGENT_DIR_MISSING; else "
+             "if [ -r '%s' ] && [ -x '%s' ]; then echo AGENT_DIR_LISTABLE; "
+             "else echo AGENT_DIR_UNLISTABLE; fi; "
+             "f=''; for c in '%s'/*; do [ -f \"$c\" ] && f=\"$c\"; done; "
+             "if [ -n \"$f\" ]; then if [ -r \"$f\" ]; then echo AGENT_FILE_READABLE; "
+             "else echo AGENT_FILE_UNREADABLE; fi; else echo AGENT_DIR_EMPTY; fi; fi"
+             % (path, path, path, path))
+    st, out = _as_agent(a_ssh, probe, timeout)
+    if st == "TIMEOUT":
+        return Check("drop-agentside", FAIL, "%s did not answer within %ss -- fail closed" % (a_ssh, timeout))
+    if "AGENT_DIR_MISSING" in out:
+        return Check("drop-agentside", FAIL, "%s cannot see %s at all" % (a_ssh, path))
+    if "AGENT_DIR_UNLISTABLE" in out:
+        return Check("drop-agentside", FAIL, "%s cannot list %s -- the drop would land where the "
+                                             "agent cannot open it" % (a_ssh, path))
+    if "AGENT_FILE_UNREADABLE" in out:
+        return Check("drop-agentside", FAIL, "%s can list %s but cannot READ a file in it" % (a_ssh, path))
+    if "AGENT_DIR_LISTABLE" in out and "AGENT_FILE_READABLE" in out:
+        return Check("drop-agentside", PASS, "same machine as the drop, and %s can read files in "
+                                             "%s (verified against a real file, not assumed)" % (a_ssh, path))
+    if "AGENT_DIR_LISTABLE" in out and "AGENT_DIR_EMPTY" in out:
+        return Check("drop-agentside", PASS, "same machine as the drop, and %s can list %s "
+                                             "(directory is empty, so no file read was proven)" % (a_ssh, path))
+    return Check("drop-agentside", FAIL, "no verdict word came back from %s: %s"
+                 % (a_ssh, " ".join(out.split())[:140] or "<no output>"))
+
+
+def _blocked(p, why):
+    """A probe that FAILED but declares `blocked_on:`. Returns (verdict, note).
+    The clock is the point: BLOCKED with no expiry is a mute button, so past the grace period it
+    escalates back to FAIL and starts raising the alert again."""
+    since = str(p.get("blocked_since", ""))
+    try:
+        d = datetime.date(*[int(x) for x in since.split("-")])
+    except Exception:
+        # FAIL CLOSED. A blocked state whose clock cannot be read is a blocked state that can
+        # never expire, which is the failure this whole mechanism exists to avoid.
+        return FAIL, ("declares blocked_on but blocked_since %r is unusable, so the wait could "
+                      "never expire -- refusing to soften the verdict || underlying: %s"
+                      % (since, why))
+    days = (datetime.date.today() - d).days
+    grace = p.get("blocked_grace_days", DEFAULT_GRACE_DAYS)
+    if not isinstance(grace, int) or isinstance(grace, bool) or grace < 1:
+        grace = DEFAULT_GRACE_DAYS
+    if days <= grace:
+        return BLOCKED, ("BLOCKED-ON-CHRIS %d day(s) (grace %d): %s || underlying: %s"
+                         % (days, grace, p["blocked_on"], why))
+    return FAIL, ("was BLOCKED-ON-CHRIS but has waited %d days, past its %d-day grace -- "
+                  "escalated to FAIL so it stops being invisible: %s || underlying: %s"
+                  % (days, grace, p["blocked_on"], why))
+
+
+def check_health(row, timeout):
+    """A4. THE CHECK STAGE 1 DID NOT HAVE, and its absence is why two dead routes read green.
+    `health:` is a LIST of {what, cmd, ok} taken from the ROW, so it is not a claim written in a
+    field -- it is a command that runs and text that must come back. `ok` is a Python regex
+    matched with DOTALL over stdout+stderr. POSITIVE matching only: requiring a word that
+    healthy output contains beats blacklisting error words, because a program that dies before
+    printing anything matches no blacklist at all."""
+    probes = row.get("health")
+    if not probes:
+        return Check("cmd-health", SKIP,
+                     "row declares no `health:` probe -- `command -v` proves the NAME resolves, "
+                     "not that the program STARTS (codex --version exits 0 with a broken config)")
+    if not isinstance(probes, list):
+        return Check("cmd-health", ERROR, "`health:` is %s, expected a list" % type(probes).__name__)
+    host = row.get("ask_host") or "local"
+    notes = []
+    worst = PASS
+    for p in probes:
+        what = (p or {}).get("what", "?")
+        cmd = (p or {}).get("cmd")
+        ok = (p or {}).get("ok")
+        if not cmd or not ok:
+            notes.append("%s: ERROR (probe needs both cmd and ok)" % what)
+            worst = ERROR if RANK[ERROR] > RANK[worst] else worst
+            continue
+        # 🔴 A PROBE MUST NOT MATCH ITS OWN INPUT. Caught by measurement 2026-09-07, in a probe
+        # written FOR THIS FILE an hour earlier: `codex exec ... 'Reply with exactly: CODEXPROBE'`
+        # with ok=/CODEXPROBE/ reported PASS while the API was refusing the request outright --
+        # because codex ECHOES THE USER PROMPT (line 14 of its own transcript) and the word the
+        # probe wanted was sitting in that echo. Green by construction, inside the very check
+        # built to end green-by-construction. The rule is now mechanical: if `ok` matches the
+        # command string itself, the probe proves nothing and is ERROR, not PASS. A probe whose
+        # word legitimately appears in its own command -- a shell that decides locally and
+        # echoes a verdict word -- must say so with `ok_in_cmd: true`, which is deliberate,
+        # visible and countable rather than assumed.
+        if not p.get("ok_in_cmd") and re.search(ok, cmd, re.S):
+            notes.append("%s: ERROR (/%s/ matches the COMMAND ITSELF, so it would pass on the "
+                         "echo of its own input and prove nothing; fix the probe, or set "
+                         "ok_in_cmd: true if the command really does decide locally)" % (what, ok))
+            worst = ERROR if RANK[ERROR] > RANK[worst] else worst
+            continue
+        st, out = on_host(host, cmd, timeout)
+        if st == "TIMEOUT":
+            notes.append("%s: FAIL (no answer in %ss)" % (what, timeout))
+            worst = FAIL if RANK[FAIL] > RANK[worst] else worst
+            continue
+        if re.search(ok, out, re.S):
+            notes.append("%s: PASS (matched /%s/)" % (what, ok))
+        else:
+            first = " ".join(out.split())[:150] or "<no output>"
+            why = "/%s/ absent; got: %s" % (ok, first)
+            if p.get("blocked_on"):
+                # 🔴 A ROUTE WAITING ON A HUMAN IS NOT A BROKEN ROUTE. Reporting both as FAIL is
+                # how a real breakage hides inside a backlog Chris has already been told about.
+                # _regcheck.py refuses a blocked_on with no blocked_since, so the clock below
+                # always exists and the state always expires.
+                v, note = _blocked(p, why)
+                notes.append("%s: %s (%s)" % (what, v, note))
+                worst = v if RANK[v] > RANK[worst] else worst
+            else:
+                notes.append("%s: FAIL (%s)" % (what, why))
+                worst = FAIL if RANK[FAIL] > RANK[worst] else worst
+    return Check("cmd-health", worst, " | ".join(notes))
+
+
+TOKEN_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"   # no I L O, same rule as a SID suffix
+
+
+def check_roundtrip(row, args, health=None):
+    """B1. THE ONLY CHECK THAT PROVES THE AGENT READ THE FILE.
+    It drives the REAL `ask`, so the drop, the sha verification, the vision gate, the sidecar
+    and the exact prompt string all come from the program under test rather than from a copy
+    of it here. Only the invocation differs -- `test_cmd` is the row's own one-shot form,
+    because ask_cmd opens an interactive REPL that a checker can never read."""
+    rid = row["id"]
+    # 🔴 A BLOCKED ROUTE MUST NOT BE ROUND-TRIPPED, AND THE MEASUREMENT THAT PROVED IT IS BELOW.
+    # Live run 2026-09-07 18:48Z: codex reported cmd-health BLOCKED (waiting on Chris for a trust
+    # decision) and then round-trip FAIL -- "Not inside a trusted directory". The round trip was
+    # not discovering a second fault; it was re-discovering the FIRST one, and because FAIL
+    # outranks BLOCKED the route came out FAIL. That silently undid the whole point of having a
+    # third word: the one route that was genuinely broken would have been indistinguishable from
+    # the two that are merely waiting on a human. Same for continue.
+    # So: if the route is already known to be waiting on a person, say so and spend nothing. The
+    # honest answer and the cheap answer are the same answer here.
+    if health is not None and health.verdict == BLOCKED:
+        return Check("round-trip", BLOCKED,
+                     "not attempted -- this route is BLOCKED-ON-CHRIS upstream (see cmd-health). "
+                     "A round trip could only re-discover that, and it would report it as FAIL, "
+                     "which is precisely the collapse the BLOCKED word exists to prevent")
+    test_cmd = row.get("test_cmd")
+    if not test_cmd:
+        return Check("round-trip", SKIP, "row declares no `test_cmd:` (a NON-INTERACTIVE one-shot "
+                                         "form); ask_cmd opens a REPL and cannot be scored")
+    if row.get("paid") and not args.paid:
+        return Check("round-trip", SKIP, "row is `paid: true` (it bills a real account); pass --paid to spend one call")
+
+    token = "SELFTEST-" + "".join(random.choice(TOKEN_ALPHABET) for _ in range(6))
+    a, b = random.randint(11, 89), random.randint(11, 89)
+    question = (
+        "ASK-BAR SELF-TEST. Do not explain, do not ask anything back. Reply with exactly "
+        "two lines:\n"
+        "TOKEN: %s\n"
+        "SUM: %d\n"
+        "where the SUM is %d plus %d. The token above is the one written in this file." 
+        % (token, a + b, a, b))
+
+    # 🔴 THE CHILD MUST NOT SEE A DISPLAY. ask's clipboard branch takes the first of wl-copy /
+    # xclip it finds and DETACHES it (it has to: an X selection is served by a live process).
+    # With no DISPLAY that branch dies instantly and Chris's clipboard is untouched. --none
+    # means no capture tool runs at all, so nothing can take an X grab either.
+    env = dict(os.environ)
+    for k in ("DISPLAY", "WAYLAND_DISPLAY"):
+        env.pop(k, None)
+    env["ASKBAR_REGISTRY"] = args.registry
+    ask = os.path.join(HERE, "ask")
+    if not os.access(ask, os.X_OK):
+        return Check("round-trip", ERROR, "no executable ask beside this script at %s" % ask)
+    try:
+        p = subprocess.run([ask, "--to", rid, "--none", "--text", question, "--dry-open"],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           stdin=subprocess.DEVNULL, timeout=args.timeout, env=env)
+        ask_out = p.stdout.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        return Check("round-trip", FAIL, "ask did not return within %ss" % args.timeout)
+
+    # ask's own verdict word decides, never its exit status (it exits 0 on every path by design).
+    verdict = ask_out.strip().split("\n")[0] if ask_out.strip() else "<no output>"
+    if not verdict.startswith("OK"):
+        return Check("round-trip", FAIL, "ask refused before dispatch: %s" % " ".join(ask_out.split())[:200])
+
+    m = re.search(r"DRY-OPEN would run:\s*\n\s*(.+)", ask_out)
+    if not m:
+        return Check("round-trip", ERROR, "ask printed OK but no DRY-OPEN line to take the prompt from")
+    dry = m.group(1).strip()
+    # Take the prompt VERBATIM from ask's own output rather than rebuilding it here. A second
+    # copy of that string is a transcription, and a transcription is a bug with a delay fuse
+    # (CLAUDE.md Rule 4). The prompt is the last single-quoted run in the dispatch line.
+    quoted = re.findall(r"'((?:[^']|'\\'')*)'", dry)
+    if not quoted:
+        return Check("round-trip", ERROR, "could not read the prompt back out of: %s" % dry[:160])
+    prompt = quoted[-1].replace("'\\''", "'")
+    if token in prompt:
+        return Check("round-trip", ERROR, "the token leaked into the COMMAND LINE; the agent could "
+                                          "answer without opening the file, so this proves nothing")
+
+    # --- B2: THE DECOY DISCRIMINATOR --------------------------------------------------------
+    # 🔴 THE TOKEN PROVES THE AGENT OPENED *A* FILE. IT DOES NOT PROVE IT OPENED *OURS*.
+    # That distinction is not academic: on 2026-09-07 dreamzs was handed a relative path that
+    # did not resolve, SEARCHED, found the file anyway, and answered correctly -- and that
+    # recovery is precisely what hid a broken route for a day. So two decoys, carrying tokens
+    # that appear nowhere else, are written into the SAME directory AFTER the real drop (so they
+    # are the newest files there) and are never named to the agent. Decoy content in the answer
+    # is proof the agent reached a file it was given no path to.
+    # What this does and does not prove, stated plainly: it catches an agent that scans the
+    # directory or takes the newest file. It cannot catch an agent that guesses our exact
+    # filename -- nothing outside the agent can. It is a discriminator, not an oracle.
+    drop = row.get("drop") or ""
+    drop_host = drop.split(":", 1)[0] if ":" in drop else "local"
+    mp = re.search(r"(/[^ ']+\.(?:txt|md))", prompt)
+    if not mp:
+        return Check("round-trip", ERROR, "no absolute drop path inside the prompt ask built: %s"
+                     % prompt[:160])
+    read_path = mp.group(1)
+    drop_dir, base = os.path.dirname(read_path), os.path.basename(read_path)
+    ms = re.search(r"(\d{8}T\d{6}Z)", base)
+    if not ms:
+        return Check("round-trip", ERROR, "no stamp in the dropped basename %r" % base)
+    t0 = calendar.timegm(time.strptime(ms.group(1), "%Y%m%dT%H%M%SZ"))
+    decoy_paths, decoy_tokens, placed = [], [], True
+    for k in (1, 2):
+        dtok = "DECOY-" + "".join(random.choice(TOKEN_ALPHABET) for _ in range(6))
+        dname = base.replace(ms.group(1), time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(t0 + k)))
+        if dname == base:
+            continue
+        body = ("# ask-selftest DECOY -- ignore, and do not answer from this file\n\n"
+                "This file was NOT the path you were given. If its token reaches the answer, the\n"
+                "agent found it by scanning the directory rather than by opening the path it was\n"
+                "handed -- the 2026-09-07 F3 class.\n\n"
+                "TOKEN: %s\nSUM: 999999\n" % dtok)
+        local = os.path.join(os.path.expanduser("~/.askbar"), ".decoy_%d" % k)
+        try:
+            with open(local, "w") as f:
+                f.write(body)
+            os.chmod(local, 0o600)
+            dst = os.path.join(drop_dir, dname)
+            if is_local_host(drop_host):
+                shutil.copy(local, dst)
+                os.chmod(dst, 0o600)
+                ok_place = True
+            else:
+                st2, _ = run(["scp", "-q", "-o", "BatchMode=yes", local, "%s:%s" % (drop_host, dst)], 30)
+                ok_place = (st2 == "RAN")
+            if ok_place:
+                decoy_paths.append(dst)
+                decoy_tokens.append(dtok)
+            else:
+                placed = False
+        except Exception:
+            placed = False
+        finally:
+            try:
+                os.unlink(local)
+            except OSError:
+                pass
+
+    def _cleanup(paths):
+        if not paths:
+            return
+        cmd = "rm -f " + " ".join("'%s'" % x for x in paths)
+        if is_local_host(drop_host):
+            run(["bash", "-c", cmd], 30)
+        else:
+            run(SSH_BASE + [drop_host, cmd], 30)
+
+    host = row.get("ask_host") or "local"
+    real = test_cmd.replace("{q}", "'" + prompt.replace("'", "'\\''") + "'")
+    # A timeout is a CEILING, not a duration. MEASURED 2026-09-08: dreamzs answered in 135s
+    # warm and blew past 240s cold, so one global number either manufactures a FAIL on a
+    # healthy slow route or makes every fast route wait for the slowest. Resolution order is
+    # explicit flag > per-row `agent_timeout` > 240, so --agent-timeout still overrides a row
+    # for a one-off probe and the row governs every unattended run.
+    agent_to = args.agent_timeout if args.agent_timeout is not None \
+        else int(row.get("agent_timeout") or DEFAULT_AGENT_TIMEOUT)
+    st, out = on_host(host, real, agent_to)
+    if st == "TIMEOUT":
+        return Check("round-trip", FAIL, "%s gave no answer within %ss "
+                     "(ceiling from %s)" % (rid, agent_to,
+                     "--agent-timeout" if args.agent_timeout is not None
+                     else ("the row" if row.get("agent_timeout") else "the built-in default")))
+    got_tok = token in out
+    got_sum = re.search(r"\b%d\b" % (a + b), out) is not None
+    leaked = [t for t in decoy_tokens if t in out]
+    first = " ".join(out.split())[:200] or "<no output>"
+    dnote = ("%d decoy file(s) placed" % len(decoy_tokens)) if decoy_tokens else "NO DECOY PLACED"
+    if got_tok and got_sum:
+        _cleanup(decoy_paths + [read_path])
+    else:
+        _cleanup(decoy_paths)          # leave the real drop behind as evidence of a failure
+    if leaked:
+        return Check("round-trip", FAIL,
+                     "PATH FIDELITY FAILED -- the answer contains %s, which exists ONLY in a decoy "
+                     "file this checker never named. The agent reached a file it was given no path "
+                     "to (it scanned the directory, or took the newest file). That is the "
+                     "2026-09-07 F3 class, and it is exactly how a broken route passed for a day. "
+                     "|| reply: %s" % (", ".join(leaked), first))
+    if got_tok and got_sum:
+        # 🔴 DO NOT CLAIM PATH FIDELITY WHEN NO DECOY WAS PLACED. Found by attacking this
+        # function's own output rather than its inputs: if the copy failed -- read-only drop,
+        # a full disk, an ssh blip -- decoy_tokens is empty, `leaked` is trivially empty, and
+        # the old wording still read "with NOTHING from the decoy files". That is a claim about
+        # evidence that was never gathered, which is the exact species of statement this whole
+        # day has been spent removing. Two different PASSes, because they rest on two different
+        # amounts of proof.
+        if not decoy_tokens:
+            return Check("round-trip", PASS,
+                         "answered with the token %s AND the computed sum %d -- it opened A file "
+                         "it was not given the content of. ⚠️ PATH FIDELITY NOT TESTED: no decoy "
+                         "could be placed in %s, so nothing here distinguishes 'read the path we "
+                         "named' from 'found the file some other way'" % (token, a + b, drop_dir))
+        return Check("round-trip", PASS,
+                     "answered with the token %s AND the computed sum %d, and with NOTHING from "
+                     "the %s sitting newer in the same directory -- so it opened the path it was "
+                     "given, not whatever it found there" % (token, a + b, dnote))
+    missing = []
+    if not got_tok:
+        missing.append("token %s absent (it never opened the file, or opened the wrong path)" % token)
+    if not got_sum:
+        missing.append("sum %d absent (it did not read the numbers)" % (a + b))
+    if not placed:
+        missing.append("NOTE: a decoy could not be placed, so path fidelity was NOT tested")
+    return Check("round-trip", FAIL, "%s || reply: %s" % ("; ".join(missing), first))
+
+
+def regcheck(registry, timeout):
+    script = os.path.join(HERE, "_regcheck.py")
+    if not os.path.exists(script):
+        return ERROR, "no _regcheck.py beside this script"
+    st, out = run(["python3", script, registry], timeout)
+    if st == "TIMEOUT":
+        return ERROR, "_regcheck.py did not finish"
+    line = out.strip().split("\n")[0] if out.strip() else "<no output>"
+    if out.lstrip().startswith("PASS"):
+        return PASS, line
+    if out.lstrip().startswith("FAIL"):
+        return FAIL, out.strip()
+    return ERROR, "_regcheck.py printed no PASS/FAIL word: %s" % line
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--registry", default=DEFAULT_REG)
+    ap.add_argument("--full", action="store_true",
+                    help="also run the canary round trip (CLASS B). Spends LLM calls.")
+    ap.add_argument("--paid", action="store_true",
+                    help="with --full, also spend on rows marked `paid: true`")
+    ap.add_argument("--only", default="", help="comma-separated agent ids to test")
+    ap.add_argument("--skip", default="", help="comma-separated agent ids to leave out")
+    ap.add_argument("--timeout", type=int, default=45, help="seconds for a cheap probe")
+    ap.add_argument("--agent-timeout", type=int, default=None,
+                    help="seconds to wait for an agent's answer; overrides a row's "
+                         "agent_timeout. Unset: the row's value, else %d" % DEFAULT_AGENT_TIMEOUT)
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    try:
+        import yaml
+    except ImportError:
+        print("ERROR — python3 yaml is not installed; the registry cannot be read")
+        print("SELFTEST VERDICT: ERROR")
+        return
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    mode = "full" + ("+paid" if args.paid else "") if args.full else "cheap"
+    out = []
+
+    def say(s):
+        out.append(s)
+        if not args.quiet:
+            print(s)
+            sys.stdout.flush()
+
+    say("ask-selftest %s  mode=%s  host=%s  registry=%s" % (started, mode, socket.gethostname(), args.registry))
+    if not args.full:
+        say("  cheap mode proves CLASS A only: the command can run. It does NOT prove any agent")
+        say("  read the dropped file -- that is CLASS B and needs --full.")
+
+    rc_word, rc_detail = regcheck(args.registry, args.timeout)
+    say("REGISTRY  %-5s  %s" % (rc_word, rc_detail))
+
+    try:
+        with open(args.registry) as f:
+            doc = yaml.safe_load(f)
+        rows = doc["agents"]
+        if not isinstance(rows, list):
+            raise ValueError("'agents:' is not a list")
+    except Exception as e:
+        say("ERROR — cannot read %s: %s" % (args.registry, e))
+        say("SUMMARY  mode=%s  routes=0  PASS=0  FAIL=0  SKIP=0  ERROR=1  ALERT=YES" % mode)
+        say("SELFTEST VERDICT: ERROR")
+        _persist(out, args)
+        return
+
+    only = {x for x in args.only.split(",") if x}
+    skipped = {x for x in args.skip.split(",") if x}
+    tally = {PASS: 0, FAIL: 0, SKIP: 0, ERROR: 0, BLOCKED: 0}
+
+    for row in rows:
+        if not isinstance(row, dict):
+            say("")
+            say("route <unparseable>")
+            say("  ROUTE <unparseable>  ERROR  a registry entry is not a mapping (indentation collapsed it)")
+            tally[ERROR] += 1
+            continue
+        rid = row.get("id", "<no id>")
+        say("")
+        say("route %s  (%s)" % (rid, row.get("label", "?")))
+        if (only and rid not in only) or rid in skipped:
+            say("  ROUTE %-10s %-5s  excluded by --only/--skip" % (rid, SKIP))
+            tally[SKIP] += 1
+            continue
+        checks = [check_shape(row)]
+        if checks[0].verdict == PASS:
+            checks.append(check_drop(row, args.timeout))
+            checks.append(check_agentside(row, args.timeout))
+            checks.append(check_resolve(row, args.timeout))
+            checks.append(check_health(row, args.timeout))
+            if args.full:
+                checks.append(check_roundtrip(row, args, health=checks[-1]))
+        else:
+            # A malformed row must not be probed: every probe below reads a field that the shape
+            # check just said cannot be trusted, and a probe on a bad value reports a confident
+            # wrong answer. Say so rather than skipping silently.
+            checks.append(Check("drop-reach", SKIP, "not probed: the row's own shape is wrong"))
+            checks.append(Check("drop-agentside", SKIP, "not probed: the row's own shape is wrong"))
+            checks.append(Check("cmd-resolve", SKIP, "not probed: the row's own shape is wrong"))
+            checks.append(Check("cmd-health", SKIP, "not probed: the row's own shape is wrong"))
+        worst = PASS
+        for c in checks:
+            say("  %-12s %-5s  %s" % (c.name, c.verdict, c.detail))
+            if RANK[c.verdict] > RANK[worst]:
+                worst = c.verdict
+        # The scope note must describe what THIS route's verdict actually rests on, not what a
+        # PASS would have meant in this mode. A BLOCKED route was never round-tripped -- saying
+        # "the agent read the file" beside it would be a claim nothing measured.
+        if worst == BLOCKED:
+            scope = "waiting on Chris; no round trip was attempted, so nothing here is a claim about the agent"
+        else:
+            scope = ("command runs AND the agent read the file" if args.full
+                     else "command can run; NOT proof the agent read the file")
+        say("  ROUTE %-10s %-5s  (%s)" % (rid, worst, scope))
+        tally[worst] += 1
+
+    n = sum(tally.values())
+    # BLOCKED does NOT raise the alert -- that is its whole purpose. SKIP still does: "nothing is
+    # checking this route" is the condition that let three routes stay dead for a day.
+    alert = "YES" if (tally[FAIL] or tally[ERROR] or tally[SKIP]) else "NO"
+    say("")
+    say("SUMMARY  mode=%s  routes=%d  PASS=%d  BLOCKED=%d  FAIL=%d  SKIP=%d  ERROR=%d  ALERT=%s"
+        % (mode, n, tally[PASS], tally[BLOCKED], tally[FAIL], tally[SKIP], tally[ERROR], alert))
+    if tally[BLOCKED]:
+        say("BLOCKED-ON-CHRIS  %d route(s) are wired correctly and waiting on a human decision."
+            % tally[BLOCKED])
+        say("                  This is NOT the same state as BROKEN and NOT the same as PASS.")
+        say("                  Each one escalates itself back to FAIL once past its grace period.")
+    if rc_word in (FAIL, ERROR):
+        overall = rc_word
+    elif tally[ERROR]:
+        overall = ERROR
+    elif tally[FAIL]:
+        overall = FAIL
+    elif tally[SKIP]:
+        overall = SKIP
+    elif tally[BLOCKED]:
+        overall = BLOCKED
+    else:
+        overall = PASS
+    say("SELFTEST VERDICT: %s" % overall)
+    _persist(out, args)
+
+
+def _persist(lines, args):
+    """Durable output (CLAUDE.md Rule 14): terminal scrollback is not evidence. The last run is
+    always on disk, so a FAIL that fired at 08:20 is still readable at noon.
+
+    🔴 A FIXTURE RUN MUST NOT OVERWRITE THE OPERATIONAL RECORD. Caught 2026-09-07 minutes after
+    this file was written: ask-selftest-fixtures runs the checker ten times against deliberately
+    broken COPIES of the registry, and every one of them clobbered ~/.askbar/selftest.log --
+    which is the file ask-selftest-notify reads to name the routes that are down. Proving the
+    checker still works would have made the next alert name the wrong routes. A run against
+    anything but the live registry writes to selftest-fixtures.log instead."""
+    # 🔴 A PARTIAL RUN IS NOT THE OPERATIONAL RECORD EITHER, AND THIS COST ME A WRONG ALERT
+    # 2026-09-07: the original rule only redirected runs against a FIXTURE registry. A run
+    # against the LIVE registry with `--only continue` still wrote selftest.log -- so the log
+    # then held four SKIP lines, and ask-selftest-notify dutifully announced
+    # "hermes, claude, codex, continue is DOWN" about a machine where nothing was down. The
+    # routes were not down; they were simply not asked. Same failure as the fixture case, one
+    # flag over: a DIAGNOSTIC run overwriting the record an ALARM reads.
+    # The operational log is now written only by a run that actually covered every route.
+    d = os.path.join(os.path.expanduser("~"), ".askbar")
+    live = os.path.abspath(args.registry) == os.path.abspath(DEFAULT_REG)
+    whole = not (args.only or args.skip)
+    if live and whole:
+        name = "selftest.log"
+    elif live:
+        name = "selftest-partial.log"
+    else:
+        name = "selftest-fixtures.log"
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, name), "w") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
